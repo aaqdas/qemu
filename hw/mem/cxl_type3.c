@@ -1207,18 +1207,34 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
 /* CXLMemSim Integration */
 #define CXL_MEMSIM_DEFAULT_HOST "127.0.0.1"
 #define CXL_MEMSIM_DEFAULT_PORT 9999
+// Back-Invalidate Snoop Requests
+enum BISnpReqType {
+    BISnpCurr = 0, // Used when device is requesting current copy of the cacheline but not installing in its cache
+    BISnpData = 1, // Used when device is requesting exclusive or shared state of cacheline
+    BISnpInv  = 2  // Used when device is requesting exclusive state of including capacity evictions
+};
 
+enum BISnpRespType {
+    BISnpI = 0, // Used when device is requesting current copy of the cacheline but not installing in its cache
+    BISnpS = 1, // Used when device is requesting exclusive or shared state of cacheline
+    BISnpE  = 2  // Used when device is requesting exclusive state of including capacity evictions
+};
+typedef enum BISnpReqType BISnpReqType;
+typedef enum BISnpRespType BISnpRespType;
 typedef struct {
     uint8_t op_type;
     uint64_t addr;
     uint64_t size;
     uint64_t timestamp;
+    BISnpRespType bisnp_resp;
     uint8_t data[64];
 } CXLMemSimRequest;
 
 typedef struct {
     uint8_t status;
     uint64_t latency_ns;
+    uint64_t addr;
+    BISnpReqType bisnp_req;
     uint8_t data[64];
 } CXLMemSimResponse;
 
