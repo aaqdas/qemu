@@ -12,7 +12,7 @@
 #include "qapi/error.h"
 #include "system/qtest.h"
 #include "hw/boards.h"
-
+#include "qemu/log.h"
 #include "qapi/qapi-visit-machine.h"
 #include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_host.h"
@@ -252,7 +252,8 @@ static MemTxResult cxl_read_cfmws(void *opaque, hwaddr addr, uint64_t *data,
 {
     CXLFixedWindow *fw = opaque;
     PCIDevice *d;
-
+    // qemu_log("CXL_TYPE3_READ: addr=0x%lx size=%u\n",
+    //                (unsigned long)addr, size);
     d = cxl_cfmws_find_device(fw, addr);
     if (d == NULL) {
         *data = 0;
@@ -269,7 +270,8 @@ static MemTxResult cxl_write_cfmws(void *opaque, hwaddr addr,
 {
     CXLFixedWindow *fw = opaque;
     PCIDevice *d;
-
+    //  qemu_log("CXL_TYPE3_WRITE: addr=0x%lx size=%u\n",
+    //                (unsigned long)addr, size);
     d = cxl_cfmws_find_device(fw, addr);
     if (d == NULL) {
         /* Writes to invalid address are silent */

@@ -3154,6 +3154,10 @@ out_unref:
 int kvm_cpu_exec(CPUState *cpu)
 {
     struct kvm_run *run = cpu->kvm_run;
+    // qemu_log("KVM_EXIT: Addr=0x%"PRIx64" Len=%d IP=0x%llx\n",
+    //      (uint64_t)run->mmio.phys_addr, 
+    //      run->mmio.len, 
+    //      (unsigned long long)run->sregs.cs.base + run->regs.rip);
     int ret, run_ret;
 
     trace_kvm_cpu_exec();
@@ -3252,6 +3256,24 @@ int kvm_cpu_exec(CPUState *cpu)
             break;
         case KVM_EXIT_MMIO:
             /* Called outside BQL */
+            // if (run->mmio.phys_addr >= 0xa90000000ULL && 
+            //     run->mmio.phys_addr <= 0xb8fffffffULL) {
+                
+            //     /* Use the class-based function pointer to get PC safely */
+            //     CPUClass *cc = CPU_GET_CLASS(cpu);
+            //     vaddr pc = 0;
+            //     if (cc->get_pc) {
+            //         pc = cc->get_pc(cpu);
+            //     }
+
+            //     qemu_log("KVM_CXL_HIT: Addr=0x%"PRIx64" Len=%d IP=0x%"VADDR_PRIx"\n",
+            //             (uint64_t)run->mmio.phys_addr, 
+            //             run->mmio.len, 
+            //             pc);
+            // }
+
+                
+                
             address_space_rw(&address_space_memory,
                              run->mmio.phys_addr, attrs,
                              run->mmio.data,

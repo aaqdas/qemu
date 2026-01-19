@@ -16,6 +16,9 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
+#define CXL_START 0xa90000000ULL
+#define CXL_END   0xb8fffffffULL
+
 
 #include "qemu/osdep.h"
 #include "exec/page-vary.h"
@@ -3130,7 +3133,10 @@ MemTxResult address_space_read_full(AddressSpace *as, hwaddr addr,
 {
     MemTxResult result = MEMTX_OK;
     FlatView *fv;
-
+    // if (addr >= CXL_START && addr <= CXL_END) {
+    //     // qemu_log("[CXL_DEBUG] Intercepted Access: Addr=0x%"HWADDR_PRIx" Len=%"HWADDR_PRId"\n", 
+    //     //         addr, len);
+    // }
     if (len > 0) {
         RCU_READ_LOCK_GUARD();
         fv = address_space_to_flatview(as);

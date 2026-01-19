@@ -1013,6 +1013,7 @@ static void ct3_exit(PCIDevice *pci_dev)
     if (ct3d->hostvmem) {
         address_space_destroy(&ct3d->hostvmem_as);
     }
+    // qemu_log("CXL Type3: Exiting CXLMemSim integration\n");
 }
 
 /*
@@ -1209,32 +1210,49 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
 #define CXL_MEMSIM_DEFAULT_PORT 9999
 // Back-Invalidate Snoop Requests
 enum BISnpReqType {
-    BISnpCurr = 0, // Used when device is requesting current copy of the cacheline but not installing in its cache
-    BISnpData = 1, // Used when device is requesting exclusive or shared state of cacheline
-    BISnpInv  = 2  // Used when device is requesting exclusive state of including capacity evictions
+    BISnpReqNone = 0, // No request needed
+    BISnpCurr = 1, // Used when device is requesting current copy of the cacheline but not installing in its cache
+    BISnpData = 2, // Used when device is requesting exclusive or shared state of cacheline
+    BISnpInv  = 3  // Used when device is requesting exclusive state of including capacity evictions
 };
 
 enum BISnpRespType {
-    BISnpI = 0, // Used when device is requesting current copy of the cacheline but not installing in its cache
-    BISnpS = 1, // Used when device is requesting exclusive or shared state of cacheline
-    BISnpE  = 2  // Used when device is requesting exclusive state of including capacity evictions
+    BISnpRespNone = 0, // No response needed
+    BISnpI = 1, // Used when device is requesting current copy of the cacheline but not installing in its cache
+    BISnpS = 2, // Used when device is requesting exclusive or shared state of cacheline
+    BISnpE  = 3  // Used when device is requesting exclusive state of including capacity evictions
 };
 typedef enum BISnpReqType BISnpReqType;
 typedef enum BISnpRespType BISnpRespType;
+
+#define OP_TYPE_READ 0
+#define OP_TYPE_WRITE 1
+#define OP_TYPE_GET_SHM_INFO 2
+#define OP_TYPE_ATOMIC_FAA 3
+#define OP_TYPE_ATOMIC_CAS 4
+#define OP_TYPE_FENCE 5
+#define OP_TYPE_BISNP 6
+
+#define PENDING_READY_TYPE_NONE 0
+#define PENDING_READY_TYPE_BISNP 1
+#define PENDING_READY_TYPE_CPU_REQ 2
 typedef struct {
-    uint8_t op_type;
+    uint8_t op_type;      // 0=READ, 1=WRITE, 2=GET_SHM_INFO, 3=ATOMIC_FAA, 4=ATOMIC_CAS, 5=FENCE
     uint64_t addr;
     uint64_t size;
     uint64_t timestamp;
-    BISnpRespType bisnp_resp;
-    uint8_t data[64];
+    uint64_t value;       // Value for FAA (add value) or CAS (desired value)
+    uint64_t expected;    // Expected value for CAS operation
+    BISnpRespType bisnp_resp_type; // Type of back-invalidate snoop response
+    uint8_t data[64];     // Cacheline data
 } CXLMemSimRequest;
 
 typedef struct {
     uint8_t status;
     uint64_t latency_ns;
+    uint64_t old_value;   // Previous value returned by atomic operations
     uint64_t addr;
-    BISnpReqType bisnp_req;
+    BISnpReqType bisnp_req_type; // Type of back-invalidate snoop request
     uint8_t data[64];
 } CXLMemSimResponse;
 
@@ -1257,15 +1275,196 @@ static struct {
     int socket_fd;
     bool connected;
     pthread_mutex_t lock;
+    // Back-Invalidate Handler
+    pthread_mutex_t pending_lock;
+    uint8_t pending_ready_type;
+    CXLMemSimResponse pending_response;
+
     uint64_t stats_reads;
     uint64_t stats_writes;
+    Cache* cache;
 } g_memsim = {
     .enabled = false,
     .initialized = false,
     .transport_mode = CXL_TRANSPORT_TCP,
     .lock = PTHREAD_MUTEX_INITIALIZER,
+    .pending_lock = PTHREAD_MUTEX_INITIALIZER,
+    .pending_ready_type = 0,
+    .pending_response = {0},
     .socket_fd = -1,
+    .cache = NULL,
 };
+
+
+/* QEMU Cache Emulation for CPUs */
+typedef enum { 
+    MESI_INVALID, 
+    MESI_SHARED, 
+    MESI_EXCLUSIVE, 
+    MESI_MODIFIED 
+} MemSimCacheState;
+
+typedef struct {
+    uint64_t tag;
+    MemSimCacheState mesi_state;
+    uint8_t* data;
+} MemSimCacheLine;
+
+typedef struct {
+    MemSimCacheLine* lines;
+    uint32_t fifo_ptr;  // Points to the next line to be evicted (FIFO)
+    uint32_t occupancy; // Number of valid lines currently in the set
+} MemSimCacheSet;
+
+typedef struct {
+    uint32_t num_sets;
+    uint32_t assoc;
+    uint32_t line_size;
+    MemSimCacheSet* sets;
+} Cache;
+
+// Helper to calculate log2 for bit shifting
+uint32_t intLog2(uint32_t n) {
+    uint32_t target = 0;
+    while (n >>= 1) ++target;
+    return target;
+}
+
+Cache* cache_create(uint32_t num_sets, uint32_t assoc, uint32_t line_size) {
+    Cache* c = (Cache*)malloc(sizeof(Cache));
+    c->num_sets = num_sets;
+    c->assoc = assoc;
+    c->line_size = line_size;
+    c->sets = (MemSimCacheSet*)malloc(sizeof(MemSimCacheSet) * num_sets);
+
+    for (uint32_t i = 0; i < num_sets; ++i) {
+        c->sets[i].lines = (MemSimCacheLine*)malloc(sizeof(MemSimCacheLine) * assoc);
+        c->sets[i].fifo_ptr = 0;
+        c->sets[i].occupancy = 0;
+        for (uint32_t j = 0; j < assoc; ++j) {
+            c->sets[i].lines[j].tag = 0;
+            c->sets[i].lines[j].mesi_state = MESI_INVALID;
+            c->sets[i].lines[j].data = (uint8_t*)malloc(line_size);
+        }
+    }
+    return c;
+}
+
+void cache_destroy(Cache* c) {
+    for (uint32_t i = 0; i < c->num_sets; ++i) {
+        for (uint32_t j = 0; j < c->assoc; ++j) {
+            free(c->sets[i].lines[j].data);
+        }
+        free(c->sets[i].lines);
+    }
+    free(c->sets);
+    free(c);
+}
+
+void cache_read(Cache* c, uint64_t addr, uint64_t* data, MemSimCacheState *mesi_state, bool* hit) {
+    uint32_t offset_bits = intLog2(c->line_size);
+    uint32_t index_bits = intLog2(c->num_sets);
+    
+    uint64_t set_no = (addr >> offset_bits) % c->num_sets;
+    uint64_t tag    = (addr >> (offset_bits + index_bits));
+
+    CacheSet* set = &c->sets[set_no];
+
+    for (uint32_t i = 0; i < c->assoc; ++i) {
+        if (set->lines[i].mesi_state != MESI_INVALID && set->lines[i].tag == tag) {
+            memcpy(data, set->lines[i].data, c->line_size);
+            *mesi_state = set->lines[i].mesi_state;
+            *hit = true;
+            return;
+        }
+    }
+    *mesi_state = MESI_INVALID;
+    *hit = false;
+}
+
+
+void cache_change_state(Cache* c, uint64_t addr, CacheState new_state) {
+    uint32_t offset_bits = intLog2(c->line_size);
+    uint32_t index_bits = intLog2(c->num_sets);
+    
+    uint64_t set_no = (addr >> offset_bits) % c->num_sets;
+    uint64_t tag    = (addr >> (offset_bits + index_bits));
+    
+    CacheSet* set = &c->sets[set_no];
+
+    // Search the set for the tag
+    for (uint32_t i = 0; i < c->assoc; ++i) {
+        // We only care about valid lines
+        if (set->lines[i].mesi_state != MESI_INVALID && set->lines[i].tag == tag) {
+            // Apply the new MESI state
+            set->lines[i].mesi_state = new_state;
+        }
+    }
+}
+
+void cache_write(Cache* c, uint64_t addr, uint64_t* data, uint64_t write_size) {
+    uint32_t offset_bits = intLog2(c->line_size);
+    uint32_t index_bits = intLog2(c->num_sets);
+    
+    uint64_t set_no = (addr >> offset_bits) % c->num_sets;
+    uint64_t tag    = (addr >> (offset_bits + index_bits));
+    uint64_t block_idx = addr & (c->line_size - 1);
+    
+    CacheSet* set = &c->sets[set_no];
+    int target_way = -1;
+
+    // 1. Search for Hit
+    for (uint32_t i = 0; i < c->assoc; ++i) {
+        if (set->lines[i].mesi_state != MESI_INVALID && set->lines[i].tag == tag) {
+            target_way = i;
+            break;
+        }
+    }
+
+    // 2. Handle Miss
+    if (target_way == -1) {
+        // Decide where to put the new data (FIFO)
+        if (set->occupancy < c->assoc) {
+            target_way = set->occupancy;
+            set->occupancy++;
+        } else {
+            target_way = set->fifo_ptr;
+            CacheLine* victim = &set->lines[target_way];
+
+            // Only generate memory traffic if the line we are kicking out is MODIFIED
+            if (victim->mesi_state == MESI_MODIFIED) {
+                uint64_t wb_addr = (victim->tag << (index_bits + offset_bits)) | (set_no << offset_bits);
+                
+                // We pass the existing victim data back to the simulator
+                cxl_memsim_request(OP_TYPE_WRITE, wb_addr, c->line_size, (uint64_t*)victim->data);
+            }
+            
+            // Advance FIFO pointer for the next eviction
+            set->fifo_ptr = (set->fifo_ptr + 1) % c->assoc;
+        }
+
+        // 3. Allocate and Setup the new entry
+        set->lines[target_way].tag = tag;
+        // Since it's a new entry and we are writing to it, 
+        // it starts as EXCLUSIVE (we own it) then becomes MODIFIED.
+        set->lines[target_way].mesi_state = MESI_EXCLUSIVE;
+        
+        // Optional: Clear the line if the write doesn't cover the full line_size
+        // memset(set->lines[target_way].data, 0, c->line_size); 
+    }
+
+    // 4. Perform the Write (Works for both Hit and newly allocated Miss)
+    memcpy(set->lines[target_way].data + block_idx, data, write_size);
+    
+    // Transition to MODIFIED because the cache now has data memory doesn't
+    set->lines[target_way].mesi_state = MESI_MODIFIED;
+}
+
+/* Ends QEMU Cache Emulation for CPUs */
+
+
+
+
 
 static void cxl_memsim_init(void) {
     /* Use double-checked locking for thread safety */
@@ -1282,10 +1481,33 @@ static void cxl_memsim_init(void) {
     }
     
     info_report("CXL Type3: Initializing CXLMemSim integration");
+
+    qemu_log("CXL Type3: Initializing CXLMemSim integration\n");
+    
     
     const char *host = getenv("CXL_MEMSIM_HOST");
     const char *port_str = getenv("CXL_MEMSIM_PORT");
     const char *transport = getenv("CXL_TRANSPORT_MODE");
+
+    const int num_sets = 2048;
+    const int assoc = 15;
+    const int line_size = 64; 
+    const char *sets_env = getenv("CXL_MEMSIM_CACHE_SETS");
+    const char *assoc_env = getenv("CXL_MEMSIM_CACHE_ASSOC");
+    const char *line_env = getenv("CXL_MEMSIM_CACHE_LINE_SIZE");
+    if (sets_env && sets_env[0]) {
+        num_sets = atoi(sets_env);
+    }
+    if (assoc_env && assoc_env[0]) {
+        assoc = atoi(assoc_env);
+    }
+    if (line_env && line_env[0]) {
+        line_size = atoi(line_env);
+    }
+
+    g_memsim.cache = cache_create(num_sets, assoc, line_size);
+
+
     if (!transport || !transport[0]) {
         transport = getenv("CXL_MEMSIM_TRANSPORT");
     }
@@ -1412,6 +1634,93 @@ static int cxl_memsim_connect_locked(void) {
     return 0;
 }
 
+static int cxl_memsim_handle_response(void) {
+    CXLMemSimResponse resp;
+    ssize_t recv_size = recv(g_memsim.socket_fd, &resp, sizeof(resp), MSG_WAITALL);
+    if (recv_size != sizeof(resp)) {
+        error_report("CXL Type3: Failed to receive response from CXLMemSim");
+        g_memsim.connected = false;
+        close(g_memsim.socket_fd);
+        g_memsim.socket_fd = -1;
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_memsim.pending_lock);
+
+    g_memsim.pending_response = resp;
+    
+    if (resp.bisnp_req_type != BISnpReqNone) { // Example response type, should be set based on actual response 
+        g_memsim.pending_ready = PENDING_READY_TYPE_BISNP;
+        BISnpRespType bisnp_resp_type;            
+        CXLMemSimRequest req = {
+            .op_type = OP_TYPE_BISNP,
+            .addr = resp.addr,
+            .size = 64, // Assuming cacheline size
+            .timestamp = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+            .bisnp_resp_type = BISnpRespNone;
+        };
+
+        CacheState cpu_cache_state;
+        bool cpu_cache_hit;
+        if (resp.bisnp_req_type == BISnpCurr) {
+            // Send the Current State of the Cache-Line
+            cache_read(g_memsim.cache, resp.addr, (uint64_t*)req.data, &cpu_cache_state, &cpu_cache_hit);
+            if (cpu_cache_hit) {
+                if (cpu_cache_state == MESI_MODIFIED) {
+                    req.bisnp_resp_type = BISnpE;
+                } else if (cpu_cache_state == MESI_EXCLUSIVE) {
+                    req.bisnp_resp_type = BISnpE;
+                } else if (cpu_cache_state == MESI_SHARED) {
+                    req.bisnp_resp_type = BISnpS;
+                } else {
+                    req.bisnp_resp_type = BISnpI;
+                }
+            } else {
+                req.bisnp_resp_type = BISnpI;
+            }
+        } else if (resp.bisnp_req_type == BISnpData) {
+            // Send the Exclusive or Shared State of the Cache-Line
+            cache_read(g_memsim.cache, resp.addr, (uint64_t*)req.data, &cpu_cache_state, &cpu_cache_hit);
+            if (cpu_cache_hit) {
+                if (cpu_cache_state == MESI_MODIFIED) {
+                    req.bisnp_resp_type = BISnpS;
+                    change_cache_state(g_memsim.cache, resp.addr, MESI_SHARED);
+                } else if (cpu_cache_state == MESI_EXCLUSIVE) {
+                    req.bisnp_resp_type = BISnpE;
+                    change_cache_state(g_memsim.cache, resp.addr, MESI_SHARED);
+                } else if (cpu_cache_state == MESI_SHARED) {
+                    req.bisnp_resp_type = BISnpS;
+                } else {
+                    req.bisnp_resp_type = BISnpI;
+                }
+            } else {
+                req.bisnp_resp_type = BISnpI;
+            }
+        } else if (resp.bisnp_req_type == BISnpInv) {
+            // Send the Exclusive State of the Cache-Line including capacity evictions
+            cache_read(g_memsim.cache, resp.addr, (uint64_t*)req.data, &cpu_cache_state, &cpu_cache_hit);
+            if (cpu_cache_hit) {
+                change_cache_state(g_memsim.cache, resp.addr, MESI_INVALID);
+                req.bisnp_resp_type = BISnpI;
+            }
+        }
+        if (send(g_memsim.socket_fd, &req, sizeof(req), MSG_NOSIGNAL) != sizeof(req)) {
+            error_report("CXL Type3: Failed to send back-invalidate request to CXLMemSim");
+            g_memsim.connected = false;
+            close(g_memsim.socket_fd);
+            g_memsim.socket_fd = -1;
+            return -1;
+        }
+        g_memsim.pending_ready = PENDING_READY_TYPE_NONE;
+    } else {
+        g_memsim.pending_ready = PENDING_READY_TYPE_CPU_REQ;
+        pthread_cond_signal(&g_memsim.pending_cv);
+    }
+
+    pthread_mutex_unlock(&g_memsim.pending_lock);
+    return 0;
+}
+
 static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
                               void *data, CXLMemSimResponse *resp) {
     static int request_count = 0;
@@ -1423,6 +1732,8 @@ static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
         .size = size,
         .timestamp = qemu_clock_get_ns(QEMU_CLOCK_REALTIME)
     };
+
+
     
     pthread_mutex_lock(&g_memsim.lock);
     
@@ -1478,14 +1789,26 @@ static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
         return -1;
     }
     
-    if (recv(g_memsim.socket_fd, resp, sizeof(*resp), MSG_WAITALL) != sizeof(*resp)) {
-        error_report("CXL Type3: Failed to receive response from CXLMemSim");
-        g_memsim.connected = false;
-        close(g_memsim.socket_fd);
-        g_memsim.socket_fd = -1;
-        pthread_mutex_unlock(&g_memsim.lock);
-        return -1;
+    // Wait for response
+    pthread_mutex_lock(&g_memsim.pending_lock);
+
+    while (g_memsim.pending_ready != PENDING_READY_TYPE_CPU_REQ) {
+        pthread_cond_wait(&g_memsim.pending_cv, &g_memsim.pending_lock);
     }
+    
+    *resp = g_memsim.pending_response;
+    g_memsim.pending_ready = false;
+
+    pthread_mutex_unlock(&g_memsim.pending_lock);
+
+    // if (recv(g_memsim.socket_fd, resp, sizeof(*resp), MSG_WAITALL) != sizeof(*resp)) {
+    //     error_report("CXL Type3: Failed to receive response from CXLMemSim");
+    //     g_memsim.connected = false;
+    //     close(g_memsim.socket_fd);
+    //     g_memsim.socket_fd = -1;
+    //     pthread_mutex_unlock(&g_memsim.lock);
+    //     return -1;
+    // }
     
     if (op == 0) g_memsim.stats_reads++;
     else g_memsim.stats_writes++;
@@ -1526,10 +1849,23 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
         
         // info_report("CXL_TYPE3_READ: Forwarding to CXLMemSim - dpa=0x%lx size=%u",
                 //    (unsigned long)dpa_offset, size);
+
+        bool cpu_cache_hit;
+        CacheState cpu_cache_mesi_state;
+
+        cache_read(g_memsim.cache, dpa_offset, data, &cpu_cache_mesi_state, &cpu_cache_hit);
+        if(cpu_cache_hit && cpu_cache_mesi_state != MESI_INVALID) {
+            return address_space_access_read(as, dpa_offset, attrs, data, size);
+        }
+
+        qemu_log("CXL_TYPE3_READ: Forwarding to CXLMemSim - dpa=0x%lx size=%u\n",
+                (unsigned long)dpa_offset, size);
+
         
         if (cxl_memsim_request(0, dpa_offset, size, NULL, &resp) == 0) {
             if (resp.status == 0 && size <= 64) {
-                memcpy(data, resp.data, size);
+                memcpy(data, resp.data, size); 
+                cache_write(g_memsim.cache, dpa_offset, (uint64_t*)data, size);
             }
             // info_report("CXL_TYPE3_READ_COMPLETE: latency=%lu ns", 
                     //    (unsigned long)resp.latency_ns);
@@ -1540,8 +1876,7 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
 }
 
 MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
-                            unsigned size, MemTxAttrs attrs)
-{
+                            unsigned size, MemTxAttrs attrs) {
     CXLType3Dev *ct3d = CXL_TYPE3(d);
     uint64_t dpa_offset = 0;
     AddressSpace *as = NULL;
@@ -1553,6 +1888,7 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     /* Log all CXL Type3 writes */
     // info_report("CXL_TYPE3_WRITE: host_addr=0x%lx size=%u data=0x%lx",
     //            (unsigned long)host_addr, size, (unsigned long)data);
+  
 
     res = cxl_type3_hpa_to_as_and_dpa(ct3d, host_addr, size,
                                       &as, &dpa_offset);
@@ -1570,10 +1906,24 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
         
         // info_report("CXL_TYPE3_WRITE: Forwarding to CXLMemSim - dpa=0x%lx size=%u",
         //            (unsigned long)dpa_offset, size);
-        
+        }
+
+        bool cpu_cache_hit;
+        CacheState cpu_cache_mesi_state;
+        uint64_t* dummy_data = (uint64_t*) malloc(sizeof(uint64_t)*g_memsim.cache->line_size/sizeof(uint64_t));
+        cache_read(g_memsim.cache, dpa_offset, data, &cpu_cache_mesi_state, &cpu_cache_hit);
+        if (cpu_cache_hit && (cpu_cache_mesi_state == MESI_MODIFIED || cpu_cache_mesi_state == MESI_EXCLUSIVE)) {
+            cache_write(g_memsim.cache, dpa_offset, &data, size);
+            return address_space_write(as, dpa_offset, attrs, &data, size);
+        }
+
+        qemu_log("CXL_TYPE3_WRITE: Forwarding to CXLMemSim - dpa=0x%lx size=%u\n",
+                (unsigned long)dpa_offset, size);
+
         if (cxl_memsim_request(1, dpa_offset, size, &data, &resp) == 0) {
             // info_report("CXL_TYPE3_WRITE_COMPLETE: latency=%lu ns",
             //            (unsigned long)resp.latency_ns);
+            cache_write(g_memsim.cache, dpa_offset, &data, size);
         }
     }
 
