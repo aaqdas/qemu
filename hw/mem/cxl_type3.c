@@ -49,6 +49,7 @@ enum CXL_T3_MSIX_VECTOR {
 
 #define DWORD_BYTE 4
 #define CXL_CAPACITY_MULTIPLIER   (256 * MiB)
+#define DEBUG_CXL_MEMSIM
 
 /* Default CDAT entries for a memory region */
 enum {
@@ -1531,8 +1532,9 @@ void cache_write(MemSimCache* memsim_cache, uint64_t dpa_addr, uint64_t* data, u
             // Only generate memory traffic if the line we are kicking out is MODIFIED
             if (victim->mesi_state != MESI_INVALID) {
                 uint64_t wb_addr = (victim->tag << (index_bits + offset_bits)) | (set_no << offset_bits);
-                #ifdef DEBUG_CXL_MEMSIM
                 qemu_log("CXL Type3: Cache Write-Back for DPA Address 0x%lx\n", wb_addr);
+                #ifdef DEBUG_CXL_MEMSIM
+                
                 qemu_log("CXL Type3: Writing back data: ");
                 for (uint32_t i = 0; i < memsim_cache->line_size
                         ; ++i) {
@@ -1905,10 +1907,10 @@ static void* cxl_memsim_handle_response(void *arg) {
                 pthread_mutex_unlock(&g_memsim.cache_lock);
             }
             req.bisnp_resp_type = BISnpI;
-            #ifdef DEBUG_CXL_MEMSIM
+            // #ifdef DEBUG_CXL_MEMSIM
             qemu_log("CXL Type3: Handling BISnpInv Request {addr=0x%lx}, responding with current cache state %d, hit: %d\n",
                      resp.addr, req.bisnp_resp_type, cpu_cache_hit);
-            #endif
+            // #endif
         }
         pthread_mutex_lock(&g_memsim.sock_lock); 
         #ifdef DEBUG_CXL_MEMSIM   
