@@ -63,7 +63,7 @@ enum {
 };
 
 static int BASELINE_TEST = 0;
-
+static int DEVICE_MEM_SIZE = 256; // Default to 256MB of memory for the device
 
 
 
@@ -174,13 +174,21 @@ typedef struct {
 static struct {
     bool enabled;
     bool initialized;
+    uint64_t dpa_base;
     char host[256];
     int port;
     enum CXLTransportMode transport_mode;
-    uint64_t latency_ns;
     int socket_fd;
     bool connected;
     pthread_mutex_t sock_lock;
+
+
+    // Memory Mapped Registers for Communication with Device
+    uint64_t quick_boot; // Skip CXLMemSim for Initialization Phase
+    uint64_t error_code; // Used to communicate specific error codes back to the device for testing purpose
+    uint64_t latency_ns;
+
+
 
     pthread_mutex_t lock;
     // Back-Invalidate Handler
@@ -200,6 +208,9 @@ static struct {
 } g_memsim = {
     .enabled = false,
     .initialized = false,
+    .dpa_base = 0x600000,
+    .quick_boot = 1,
+    .error_code = 0,
     .transport_mode = CXL_TRANSPORT_TCP,
     .latency_ns = 0,
     .lock = PTHREAD_MUTEX_INITIALIZER,
@@ -1613,6 +1624,7 @@ static void cxl_memsim_init(void) {
     const char *host = getenv("CXL_MEMSIM_HOST");
     const char *port_str = getenv("CXL_MEMSIM_PORT");
     const char *transport = getenv("CXL_TRANSPORT_MODE");
+    
 
     int num_sets = 2048;
     int assoc = 15;
@@ -1641,8 +1653,26 @@ static void cxl_memsim_init(void) {
     const char *rdma_port = getenv("CXL_MEMSIM_RDMA_PORT");
     
     const char *baseline_test = getenv("CXLMEMSIM_BASELINE_TEST");
+    const char *device_mem_size = getenv("CXL_MEMSIM_DEVICE_MEM_SIZE");
     if (baseline_test && baseline_test[0]) {
         BASELINE_TEST = atoi(baseline_test);
+    }
+    if (device_mem_size && device_mem_size[0]) {
+        DEVICE_MEM_SIZE = strtoull(device_mem_size, NULL, 10);
+    }
+
+    qemu_log("CXL Type3: CXLMemSim Memory Size: %d MB", DEVICE_MEM_SIZE);
+
+    switch(DEVICE_MEM_SIZE) {
+        case 256: g_memsim.dpa_base = 0x600000ULL; break;
+        // Dummy Values Fill Out
+        case 512: g_memsim.dpa_base = 0xA00000ULL; break;
+        case 1024: g_memsim.dpa_base = 0x1200000ULL; break;
+        case 2048: g_memsim.dpa_base = 0x2200000ULL; break;
+        case 4096: g_memsim.dpa_base = 0x4200000ULL; break;
+        case 8192: g_memsim.dpa_base = 0x8200000ULL; break;
+        case 16384: g_memsim.dpa_base = 0x10200000ULL; break;
+        default: g_memsim.dpa_base = 0x600000ULL; break;
     }
 
     if (!host || !host[0]) {
@@ -2109,27 +2139,40 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     }
 
 
-
-
-    if (BASELINE_TEST) {
+    if (BASELINE_TEST || g_memsim.quick_boot || dpa_offset < g_memsim.dpa_base) {
         ret = address_space_read(as, dpa_offset, attrs, data, size);
         #ifdef DEBUG_CXL_MEMSIM
         qemu_log("CXL_TYPE3_READ_BASELINE: dpa=0x%lx size=%u data=0x%lx\n",
                 (unsigned long)dpa_offset, size, (unsigned long)data[0]);
         #endif
         return ret;
+    } else {
+        if (dpa_offset >= g_memsim.dpa_base && dpa_offset < g_memsim.dpa_base + 0x1000) {
+            switch(dpa_offset - g_memsim.dpa_base) {
+                case 0x0: 
+                    memcpy((void*)data, (void*)&g_memsim.latency_ns, size);
+                    break;
+                case 0x8:
+                    memcpy((void*)data, (void*)&g_memsim.quick_boot, size);
+                    break;
+                default:
+                    memcpy((void*)data, (void*)&g_memsim.error_code, size);
+                    break;
+            }
+            return MEMTX_OK;
+        }
     }
 
     /* Forward to CXLMemSim if enabled */
     if (g_memsim.enabled) {
-        if (dpa_offset >= 0x600000 && dpa_offset < 0x600000 + 0x1000) {
-            memcpy((void*)data, (void*)&g_memsim.latency_ns, size);
-            #ifdef DEBUG_CXL_MEMSIM
-            qemu_log("CXL_TYPE3_READ_LATENCY_REG: dpa=0x%lx size=%u latency_ns=%lu\n",
-                    (unsigned long)dpa_offset, size, (unsigned long)g_memsim.latency_ns);
-            #endif
-            return MEMTX_OK;
-        }
+        // if (dpa_offset >= 0x600000 && dpa_offset < 0x600000 + 0x1000) {
+        //     memcpy((void*)data, (void*)&g_memsim.latency_ns, size);
+        //     #ifdef DEBUG_CXL_MEMSIM
+        //     qemu_log("CXL_TYPE3_READ_LATENCY_REG: dpa=0x%lx size=%u latency_ns=%lu\n",
+        //             (unsigned long)dpa_offset, size, (unsigned long)g_memsim.latency_ns);
+        //     #endif
+        //     return MEMTX_OK;
+        // }
         CXLMemSimResponse resp = {0};
         
         // info_report("CXL_TYPE3_READ: Forwarding to CXLMemSim - dpa=0x%lx size=%u",
@@ -2148,9 +2191,10 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
         pthread_mutex_lock(&g_memsim.cache_lock);
         cache_read(g_memsim.cache, cache_line_addr, (uint64_t*)dummy_data, &cpu_cache_mesi_state, &cpu_cache_hit);
         pthread_mutex_unlock(&g_memsim.cache_lock);
-        if (dpa_offset >= 0x600000 + 0x1000) {
-            g_memsim.latency_ns = L3_CACHE_LATENCY_NS;
-        }
+        // if (dpa_offset >= g_memsim.dpa_base + 0x1000) {
+        // assert(dpa_offset - g_memsim.dpa_base >= 0x1000 && "DPA offset should be beyond the control region");
+        g_memsim.latency_ns = L3_CACHE_LATENCY_NS;
+        // }
         if(cpu_cache_hit && cpu_cache_mesi_state != MESI_INVALID) {
             #ifdef DEBUG_CXL_MEMSIM
             qemu_log("CXL_TYPE3_READ: Cache Hit for dpa=0x%lx size=%u mesi_state=%d\n",
@@ -2198,9 +2242,9 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
             qemu_log("CXL_TYPE3_READ_COMPLETE: latency=%lu ns\n",
                     (unsigned long)resp.latency_ns);
             #endif
-            if (cache_line_addr >= 0x600000 + 0x1000) {
-                 g_memsim.latency_ns =  resp.latency_ns + L3_CACHE_LATENCY_NS;
-            }
+            // if (cache_line_addr >= 0x600000 + 0x1000) {
+            g_memsim.latency_ns =  resp.latency_ns + L3_CACHE_LATENCY_NS;
+            // }
 
             if (resp.status == 0 && size <= 64) {
                 memcpy((void*)data, (void*)resp.data + offset_idx, size); 
@@ -2279,8 +2323,18 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     if (cxl_dev_media_disabled(&ct3d->cxl_dstate)) {
         return MEMTX_OK;
     }
+    // Configuration Space
+    
+    if (dpa_offset >= g_memsim.dpa_base && dpa_offset < g_memsim.dpa_base + 0x1000) {
+        switch(dpa_offset - g_memsim.dpa_base) {
+            // case 0x0: memcpy(&g_memsim.latency_ns, (void*)&data, size);  break;// Copy from data to latency_ns    
+            case 0x8: memcpy(&g_memsim.quick_boot, (void*)&data, size);  break;// Copy from data to quick_boot buffer
+            default: g_memsim.error_code = -1;   break; // Copy from data to error buffer
+        }
+        return MEMTX_OK;
+    }
 
-    if (BASELINE_TEST) {
+    if (BASELINE_TEST  || g_memsim.quick_boot || dpa_offset < g_memsim.dpa_base) {
         ret = address_space_write(as, dpa_offset, attrs, &data, size);
         #ifdef DEBUG_CXL_MEMSIM
         qemu_log("CXL_TYPE3_WRITE_BASELINE: dpa=0x%lx size=%u data=0x%lx\n",
