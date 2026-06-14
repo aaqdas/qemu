@@ -454,9 +454,71 @@ hwaddr cxl_fmws_set_memmap(hwaddr base, hwaddr max_addr)
 static void cxl_fmw_realize(DeviceState *dev, Error **errp)
 {
     CXLFixedWindow *fw = CXL_FMW(dev);
+    const char *ram_path = getenv("CXL_MR_BACKING_FILE");
+    const char *ram_size_str = getenv("CXL_MR_BACKING_SIZE");
 
-    memory_region_init_io(&fw->mr, OBJECT(dev), &cfmws_ops, fw,
-                          "cxl-fixed-memory-region", fw->size);
+    if (ram_path) {
+        /*
+         * Expose the CXL device region as a RAM-backed memory region so
+         * KVM maps it as a proper memory slot. This allows ALL CPU
+         * instruction types (flds, vmovss, AVX, etc.) without MMIO
+         * trapping -- avoiding #UD (SIGILL) from KVM's limited emulator.
+         *
+         * CXL_MR_BACKING_FILE: path to the backing file (e.g. cxl.raw)
+         * CXL_MR_BACKING_SIZE: size of the device region in bytes
+         *   (defaults to fw->size if not set; must match file size)
+         */
+        uint64_t ram_size = fw->size;
+        if (ram_size_str) {
+            ram_size = strtoull(ram_size_str, NULL, 0);
+        }
+
+        if (ram_size < fw->size) {
+            /*
+             * File is smaller than CFMWS window: use a container region.
+             * The device RAM region covers [0, ram_size); the remainder
+             * [ram_size, fw->size) uses the MMIO callbacks (unmapped/poison).
+             */
+            MemoryRegion *ram_sub = g_new0(MemoryRegion, 1);
+            MemoryRegion *io_sub  = g_new0(MemoryRegion, 1);
+
+            memory_region_init(&fw->mr, OBJECT(dev),
+                               "cxl-fixed-memory-region", fw->size);
+
+            if (!memory_region_init_ram_from_file(ram_sub, OBJECT(dev),
+                                                  "cxl-fmw-ram",
+                                                  ram_size,
+                                                  0, RAM_SHARED,
+                                                  ram_path, 0, errp)) {
+                return;
+            }
+            memory_region_init_io(io_sub, OBJECT(dev), &cfmws_ops, fw,
+                                  "cxl-fmw-io", fw->size - ram_size);
+
+            memory_region_add_subregion(&fw->mr, 0,        ram_sub);
+            memory_region_add_subregion(&fw->mr, ram_size, io_sub);
+
+            fprintf(stderr,
+                    "CXL CFMWS: RAM-backed[0..0x%lx] + MMIO[0x%lx..0x%lx]\n",
+                    (unsigned long)ram_size,
+                    (unsigned long)ram_size, (unsigned long)fw->size);
+        } else {
+            /* File covers full window: map everything as RAM */
+            if (!memory_region_init_ram_from_file(&fw->mr, OBJECT(dev),
+                                                  "cxl-fixed-memory-region",
+                                                  fw->size,
+                                                  0, RAM_SHARED,
+                                                  ram_path, 0, errp)) {
+                return;
+            }
+            fprintf(stderr, "CXL CFMWS: full RAM-backed mode (size=0x%lx)\n",
+                    (unsigned long)fw->size);
+        }
+    } else {
+        /* Default: MMIO region with per-access callbacks (CXLMemSim path) */
+        memory_region_init_io(&fw->mr, OBJECT(dev), &cfmws_ops, fw,
+                              "cxl-fixed-memory-region", fw->size);
+    }
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &fw->mr);
 }
 
