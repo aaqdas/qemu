@@ -11,30 +11,30 @@
 #include <math.h>
 
 #include "qemu/osdep.h"
-#include "qemu/units.h"
-#include "qemu/error-report.h"
-#include "qapi/qapi-commands-cxl.h"
+#include "hw/cxl/cxl.h"
 #include "hw/mem/memory-device.h"
 #include "hw/mem/pc-dimm.h"
+#include "hw/pci/msix.h"
 #include "hw/pci/pci.h"
-#include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
+#include "hw/qdev-properties.h"
 #include "qapi/error.h"
+#include "qapi/qapi-commands-cxl.h"
+#include "qemu/error-report.h"
+#include "qemu/guest-random.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "../../../../include/cxl_file_transport.h"
 #include "qemu/pmem.h"
 #include "qemu/range.h"
 #include "qemu/rcu.h"
-#include "qemu/guest-random.h"
+#include "qemu/units.h"
 #include "system/hostmem.h"
 #include "system/numa.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <pthread.h>
-#include "hw/cxl/cxl.h"
-#include "hw/pci/msix.h"
-
+#include <sys/socket.h>
 
 /* Include RDMA support header */
 #include "cxl_type3_rdma.h"
@@ -48,7 +48,7 @@ enum CXL_T3_MSIX_VECTOR {
 };
 
 #define DWORD_BYTE 4
-#define CXL_CAPACITY_MULTIPLIER   (256 * MiB)
+#define CXL_CAPACITY_MULTIPLIER (256 * MiB)
 // #define DEBUG_CXL_MEMSIM
 // #define VERBOSE_CXL_MEMSIM
 /* Default CDAT entries for a memory region */
@@ -67,7 +67,6 @@ static int DEVICE_MEM_SIZE = 256; // Default to 256MB of memory for the device
 
 #define LATENCY_TABLE_ENTRIES 20 // Number of entries in the latency table
 
-
 /* CXLMemSim Integration */
 #define CXL_MEMSIM_DEFAULT_HOST "192.168.100.1"
 #define CXL_MEMSIM_DEFAULT_PORT 9999
@@ -76,27 +75,24 @@ enum BISnpReqType {
     BISnpReqNone = 0, // No request needed
     BISnpCurr = 1, // Used when device is requesting current copy of the cacheline but not installing in its cache
     BISnpData = 2, // Used when device is requesting exclusive or shared state of cacheline
-    BISnpInv  = 3  // Used when device is requesting exclusive state of including capacity evictions
+    BISnpInv = 3 // Used when device is requesting exclusive state of including capacity evictions
 };
 
 enum BISnpRespType {
     BISnpRespNone = 0, // No response needed
     BISnpI = 1, // Used when device is requesting current copy of the cacheline but not installing in its cache
     BISnpS = 2, // Used when device is requesting exclusive or shared state of cacheline
-    BISnpE  = 3  // Used when device is requesting exclusive state of including capacity evictions
+    BISnpE = 3 // Used when device is requesting exclusive state of including capacity evictions
 };
 
 enum CXLMemSnpType {
     SnpTypeNOOP = 0, // No response needed
     SnpInv = 1, // Requester needs a exclusive copy of the cacheline
-    SnpCurr = 2, // Used when device is current data and won't cache 
-    SnpData  = 3  // Used when device is requesting shared/exclusive copy of the cacheline and will cache it
+    SnpCurr = 2, // Used when device is current data and won't cache
+    SnpData = 3 // Used when device is requesting shared/exclusive copy of the cacheline and will cache it
 };
 
-enum RespStatus {
-    RESP_STATUS_SUCCESS = 0,
-    RESP_STATUS_FAILURE = 1
-};
+enum RespStatus { RESP_STATUS_SUCCESS = 0, RESP_STATUS_FAILURE = 1 };
 
 typedef enum BISnpReqType BISnpReqType;
 typedef enum BISnpRespType BISnpRespType;
@@ -116,31 +112,26 @@ typedef enum RespStatus RespStatus;
 #define PENDING_READY_TYPE_CPU_REQ 2
 
 #define L3_CACHE_LATENCY_NS 50 // 50ns or 110 Cycles on Average
-typedef enum { 
-    MESI_INVALID, 
-    MESI_SHARED, 
-    MESI_EXCLUSIVE, 
-    MESI_MODIFIED 
-} MemSimCacheState;
+typedef enum { MESI_INVALID, MESI_SHARED, MESI_EXCLUSIVE, MESI_MODIFIED } MemSimCacheState;
 typedef struct {
-    uint8_t op_type;      // 0=READ, 1=WRITE, 2=GET_SHM_INFO, 3=ATOMIC_FAA, 4=ATOMIC_CAS, 5=FENCE
+    uint8_t op_type; // 0=READ, 1=WRITE, 2=GET_SHM_INFO, 3=ATOMIC_FAA, 4=ATOMIC_CAS, 5=FENCE
     uint64_t addr;
     uint64_t size;
     uint64_t timestamp;
-    uint64_t value;       // Value for FAA (add value) or CAS (desired value)
-    uint64_t expected;    // Expected value for CAS operation
-    uint64_t resp_thread_id;   // Loopback the ID of the Requesting Thread in Server
+    uint64_t value; // Value for FAA (add value) or CAS (desired value)
+    uint64_t expected; // Expected value for CAS operation
+    uint64_t resp_thread_id; // Loopback the ID of the Requesting Thread in Server
     CXLMemSnpType snp_type;
     MemSimCacheState metavalue; // CPU cache MESI state for the address
     BISnpRespType bisnp_resp_type; // Type of back-invalidate snoop response
-    uint8_t data[64];     // Cacheline data
+    uint8_t data[64]; // Cacheline data
 } CXLMemSimRequest;
 
 typedef struct {
     uint8_t op_type;
     RespStatus status;
     uint64_t latency_ns;
-    uint64_t old_value;   // Previous value returned by atomic operations
+    uint64_t old_value; // Previous value returned by atomic operations
     uint64_t req_thread_id; // ID of the Requesting Thread in Server
     uint64_t addr;
     BISnpReqType bisnp_req_type; // Type of back-invalidate snoop request
@@ -148,25 +139,20 @@ typedef struct {
 } CXLMemSimResponse;
 
 /* Transport mode enum */
-enum CXLTransportMode {
-    CXL_TRANSPORT_TCP = 0,
-    CXL_TRANSPORT_RDMA = 1,
-    CXL_TRANSPORT_SHM = 2
-};
+enum CXLTransportMode { CXL_TRANSPORT_TCP = 0, CXL_TRANSPORT_RDMA = 1, CXL_TRANSPORT_SHM = 2, CXL_TRANSPORT_FILE = 3 };
 
 /* QEMU Cache Emulation for CPUs */
-
 
 typedef struct {
     uint64_t tag;
     MemSimCacheState mesi_state;
-    uint8_t* data;
+    uint8_t *data;
     pthread_mutex_t lock;
 } MemSimCacheLine;
 
 typedef struct {
-    MemSimCacheLine* lines;
-    uint32_t fifo_ptr;  // Points to the next line to be evicted (FIFO)
+    MemSimCacheLine *lines;
+    uint32_t fifo_ptr; // Points to the next line to be evicted (FIFO)
     uint32_t occupancy; // Number of valid lines currently in the set
 } MemSimCacheSet;
 
@@ -174,7 +160,7 @@ typedef struct {
     uint32_t num_sets;
     uint32_t assoc;
     uint32_t line_size;
-    MemSimCacheSet* sets;
+    MemSimCacheSet *sets;
 } MemSimCache;
 
 typedef struct {
@@ -192,7 +178,7 @@ static struct {
     int socket_fd;
     bool connected;
     pthread_mutex_t sock_lock;
-
+    cxl_file_transport_t file_transport;
 
     // Memory Mapped Registers for Communication with Device
     uint64_t quick_boot; // Skip CXLMemSim for Initialization Phase
@@ -200,19 +186,17 @@ static struct {
     uint64_t latency_ns;
     uint64_t stat_last_access_addr; // Last accessed address for statistics
 
-
     pthread_mutex_t lock;
     // Back-Invalidate Handler
     pthread_mutex_t pending_lock;
     uint8_t pending_ready_type;
     CXLMemSimResponse pending_response;
     pthread_cond_t pending_cv;
-    
 
     uint64_t stats_reads;
     uint64_t stats_writes;
     MemSimLatencyEntry latency_entries[LATENCY_TABLE_ENTRIES];
-    MemSimCache* cache;
+    MemSimCache *cache;
     pthread_mutex_t cache_lock;
 
     pthread_t response_thread;
@@ -233,23 +217,23 @@ static struct {
     .pending_ready_type = 0,
     .pending_response = {0},
     .socket_fd = -1,
-    .cache = (MemSimCache*)NULL,
+    .file_transport = {.fd = -1},
+    .cache = (MemSimCache *)NULL,
     .pending_cv = PTHREAD_COND_INITIALIZER,
 };
 
-
-static void* cxl_memsim_handle_response_thread(void *arg);
-static void* cxl_memsim_handle_response(void *arg);
+static void *cxl_memsim_handle_response_thread(void *arg);
+static void *cxl_memsim_handle_response(void *arg);
 static bool cxl_memsim_has_response(CXLMemSimRequest req);
-static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
-                              void *data, CXLMemSnpType snp_type, MemSimCacheState metavalue, CXLMemSimResponse *resp);
+static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size, void *data, CXLMemSnpType snp_type,
+                              MemSimCacheState metavalue, CXLMemSimResponse *resp);
 
 static void cxl_memsim_init(void);
-void cache_write(MemSimCache* memsim_cache, uint64_t dpa_addr, uint64_t* data, uint64_t write_size);
-void cache_read(MemSimCache* memsim_cache, uint64_t dpa_addr, uint64_t* data, MemSimCacheState *mesi_state, bool* hit);
-void change_cache_state(MemSimCache* memsim_cache, uint64_t addr, MemSimCacheState new_state);
+void cache_write(MemSimCache *memsim_cache, uint64_t dpa_addr, uint64_t *data, uint64_t write_size);
+void cache_read(MemSimCache *memsim_cache, uint64_t dpa_addr, uint64_t *data, MemSimCacheState *mesi_state, bool *hit);
+void change_cache_state(MemSimCache *memsim_cache, uint64_t addr, MemSimCacheState new_state);
 void cache_destroy(MemSimCache *memsim_cache);
-MemSimCache* cache_create(uint32_t num_sets, uint32_t assoc, uint32_t line_size);
+MemSimCache *cache_create(uint32_t num_sets, uint32_t assoc, uint32_t line_size);
 uint32_t intLog2(uint32_t n);
 static int cxl_memsim_connect_locked(void);
 // parallel search function that gives the idx in latency entries where dpa matches or aborts with error if not found
@@ -262,13 +246,8 @@ static int find_latency_entry_idx(uint64_t dpa) {
     return -1; // Not found
 }
 
-
-
-static void ct3_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
-                                          int dsmad_handle, uint64_t size,
-                                          bool is_pmem, bool is_dynamic,
-                                          uint64_t dpa_base)
-{
+static void ct3_build_cdat_entries_for_mr(CDATSubHeader **cdat_table, int dsmad_handle, uint64_t size, bool is_pmem,
+                                          bool is_dynamic, uint64_t dpa_base) {
     CDATDsmas *dsmas;
     CDATDslbis *dslbis0;
     CDATDslbis *dslbis1;
@@ -277,25 +256,26 @@ static void ct3_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
     CDATDsemts *dsemts;
 
     dsmas = g_malloc(sizeof(*dsmas));
-    *dsmas = (CDATDsmas) {
-        .header = {
-            .type = CDAT_TYPE_DSMAS,
-            .length = sizeof(*dsmas),
-        },
+    *dsmas = (CDATDsmas){
+        .header =
+            {
+                .type = CDAT_TYPE_DSMAS,
+                .length = sizeof(*dsmas),
+            },
         .DSMADhandle = dsmad_handle,
-        .flags = (is_pmem ? CDAT_DSMAS_FLAG_NV : 0) |
-                 (is_dynamic ? CDAT_DSMAS_FLAG_DYNAMIC_CAP : 0),
+        .flags = (is_pmem ? CDAT_DSMAS_FLAG_NV : 0) | (is_dynamic ? CDAT_DSMAS_FLAG_DYNAMIC_CAP : 0),
         .DPA_base = dpa_base,
         .DPA_length = size,
     };
 
     /* For now, no memory side cache, plausiblish numbers */
     dslbis0 = g_malloc(sizeof(*dslbis0));
-    *dslbis0 = (CDATDslbis) {
-        .header = {
-            .type = CDAT_TYPE_DSLBIS,
-            .length = sizeof(*dslbis0),
-        },
+    *dslbis0 = (CDATDslbis){
+        .header =
+            {
+                .type = CDAT_TYPE_DSLBIS,
+                .length = sizeof(*dslbis0),
+            },
         .handle = dsmad_handle,
         .flags = HMAT_LB_MEM_MEMORY,
         .data_type = HMAT_LB_DATA_READ_LATENCY,
@@ -304,11 +284,12 @@ static void ct3_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
     };
 
     dslbis1 = g_malloc(sizeof(*dslbis1));
-    *dslbis1 = (CDATDslbis) {
-        .header = {
-            .type = CDAT_TYPE_DSLBIS,
-            .length = sizeof(*dslbis1),
-        },
+    *dslbis1 = (CDATDslbis){
+        .header =
+            {
+                .type = CDAT_TYPE_DSLBIS,
+                .length = sizeof(*dslbis1),
+            },
         .handle = dsmad_handle,
         .flags = HMAT_LB_MEM_MEMORY,
         .data_type = HMAT_LB_DATA_WRITE_LATENCY,
@@ -317,11 +298,12 @@ static void ct3_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
     };
 
     dslbis2 = g_malloc(sizeof(*dslbis2));
-    *dslbis2 = (CDATDslbis) {
-        .header = {
-            .type = CDAT_TYPE_DSLBIS,
-            .length = sizeof(*dslbis2),
-        },
+    *dslbis2 = (CDATDslbis){
+        .header =
+            {
+                .type = CDAT_TYPE_DSLBIS,
+                .length = sizeof(*dslbis2),
+            },
         .handle = dsmad_handle,
         .flags = HMAT_LB_MEM_MEMORY,
         .data_type = HMAT_LB_DATA_READ_BANDWIDTH,
@@ -330,11 +312,12 @@ static void ct3_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
     };
 
     dslbis3 = g_malloc(sizeof(*dslbis3));
-    *dslbis3 = (CDATDslbis) {
-        .header = {
-            .type = CDAT_TYPE_DSLBIS,
-            .length = sizeof(*dslbis3),
-        },
+    *dslbis3 = (CDATDslbis){
+        .header =
+            {
+                .type = CDAT_TYPE_DSLBIS,
+                .length = sizeof(*dslbis3),
+            },
         .handle = dsmad_handle,
         .flags = HMAT_LB_MEM_MEMORY,
         .data_type = HMAT_LB_DATA_WRITE_BANDWIDTH,
@@ -343,11 +326,12 @@ static void ct3_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
     };
 
     dsemts = g_malloc(sizeof(*dsemts));
-    *dsemts = (CDATDsemts) {
-        .header = {
-            .type = CDAT_TYPE_DSEMTS,
-            .length = sizeof(*dsemts),
-        },
+    *dsemts = (CDATDsemts){
+        .header =
+            {
+                .type = CDAT_TYPE_DSEMTS,
+                .length = sizeof(*dsemts),
+            },
         .DSMAS_handle = dsmad_handle,
         /*
          * NV: Reserved - the non volatile from DSMAS matters
@@ -367,8 +351,7 @@ static void ct3_build_cdat_entries_for_mr(CDATSubHeader **cdat_table,
     cdat_table[CT3_CDAT_DSEMTS] = (CDATSubHeader *)dsemts;
 }
 
-static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
-{
+static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv) {
     g_autofree CDATSubHeader **table = NULL;
     CXLType3Dev *ct3d = priv;
     MemoryRegion *volatile_mr = NULL, *nonvolatile_mr = NULL;
@@ -415,15 +398,13 @@ static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
 
     /* Now fill them in */
     if (volatile_mr) {
-        ct3_build_cdat_entries_for_mr(table, dsmad_handle++, vmr_size,
-                                      false, false, 0);
+        ct3_build_cdat_entries_for_mr(table, dsmad_handle++, vmr_size, false, false, 0);
         cur_ent = CT3_CDAT_NUM_ENTRIES;
     }
 
     if (nonvolatile_mr) {
         uint64_t base = vmr_size;
-        ct3_build_cdat_entries_for_mr(&(table[cur_ent]), dsmad_handle++,
-                                      pmr_size, true, false, base);
+        ct3_build_cdat_entries_for_mr(&(table[cur_ent]), dsmad_handle++, pmr_size, true, false, base);
         cur_ent += CT3_CDAT_NUM_ENTRIES;
     }
 
@@ -442,11 +423,8 @@ static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
             ct3d->dc.regions[i].hw_managed_coherency = false;
             ct3d->dc.regions[i].ic_specific_dc_management = false;
             ct3d->dc.regions[i].rdonly = false;
-            ct3_build_cdat_entries_for_mr(&(table[cur_ent]),
-                                          dsmad_handle++,
-                                          ct3d->dc.regions[i].len,
-                                          ct3d->dc.regions[i].nonvolatile,
-                                          true, region_base);
+            ct3_build_cdat_entries_for_mr(&(table[cur_ent]), dsmad_handle++, ct3d->dc.regions[i].len,
+                                          ct3d->dc.regions[i].nonvolatile, true, region_base);
             ct3d->dc.regions[i].dsmadhandle = dsmad_handle - 1;
 
             cur_ent += CT3_CDAT_NUM_ENTRIES;
@@ -461,8 +439,7 @@ static int ct3_build_cdat_table(CDATSubHeader ***cdat_table, void *priv)
     return len;
 }
 
-static void ct3_free_cdat_table(CDATSubHeader **cdat_table, int num, void *priv)
-{
+static void ct3_free_cdat_table(CDATSubHeader **cdat_table, int num, void *priv) {
     int i;
 
     for (i = 0; i < num; i++) {
@@ -471,8 +448,7 @@ static void ct3_free_cdat_table(CDATSubHeader **cdat_table, int num, void *priv)
     g_free(cdat_table);
 }
 
-static bool cxl_doe_cdat_rsp(DOECap *doe_cap)
-{
+static bool cxl_doe_cdat_rsp(DOECap *doe_cap) {
     CDATObject *cdat = &CXL_TYPE3(doe_cap->pdev)->cxl_cstate.cdat;
     uint16_t ent;
     void *base;
@@ -483,8 +459,7 @@ static bool cxl_doe_cdat_rsp(DOECap *doe_cap)
     assert(cdat->entry_len);
 
     /* Discard if request length mismatched */
-    if (pcie_doe_get_obj_len(req) <
-        DIV_ROUND_UP(sizeof(CDATReq), DWORD_BYTE)) {
+    if (pcie_doe_get_obj_len(req) < DIV_ROUND_UP(sizeof(CDATReq), DWORD_BYTE)) {
         return false;
     }
 
@@ -492,30 +467,28 @@ static bool cxl_doe_cdat_rsp(DOECap *doe_cap)
     base = cdat->entry[ent].base;
     len = cdat->entry[ent].length;
 
-    rsp = (CDATRsp) {
-        .header = {
-            .vendor_id = CXL_VENDOR_ID,
-            .data_obj_type = CXL_DOE_TABLE_ACCESS,
-            .reserved = 0x0,
-            .length = DIV_ROUND_UP((sizeof(rsp) + len), DWORD_BYTE),
-        },
+    rsp = (CDATRsp){
+        .header =
+            {
+                .vendor_id = CXL_VENDOR_ID,
+                .data_obj_type = CXL_DOE_TABLE_ACCESS,
+                .reserved = 0x0,
+                .length = DIV_ROUND_UP((sizeof(rsp) + len), DWORD_BYTE),
+            },
         .rsp_code = CXL_DOE_TAB_RSP,
         .table_type = CXL_DOE_TAB_TYPE_CDAT,
-        .entry_handle = (ent < cdat->entry_len - 1) ?
-                        ent + 1 : CXL_DOE_TAB_ENT_MAX,
+        .entry_handle = (ent < cdat->entry_len - 1) ? ent + 1 : CXL_DOE_TAB_ENT_MAX,
     };
 
     memcpy(doe_cap->read_mbox, &rsp, sizeof(rsp));
-    memcpy(doe_cap->read_mbox + DIV_ROUND_UP(sizeof(rsp), DWORD_BYTE),
-           base, len);
+    memcpy(doe_cap->read_mbox + DIV_ROUND_UP(sizeof(rsp), DWORD_BYTE), base, len);
 
     doe_cap->read_mbox_len += rsp.header.length;
 
     return true;
 }
 
-static uint32_t ct3d_config_read(PCIDevice *pci_dev, uint32_t addr, int size)
-{
+static uint32_t ct3d_config_read(PCIDevice *pci_dev, uint32_t addr, int size) {
     CXLType3Dev *ct3d = CXL_TYPE3(pci_dev);
     uint32_t val;
 
@@ -526,9 +499,7 @@ static uint32_t ct3d_config_read(PCIDevice *pci_dev, uint32_t addr, int size)
     return pci_default_read_config(pci_dev, addr, size);
 }
 
-static void ct3d_config_write(PCIDevice *pci_dev, uint32_t addr, uint32_t val,
-                              int size)
-{
+static void ct3d_config_write(PCIDevice *pci_dev, uint32_t addr, uint32_t val, int size) {
     CXLType3Dev *ct3d = CXL_TYPE3(pci_dev);
 
     pcie_doe_write_config(&ct3d->doe_cdat, addr, val, size);
@@ -542,14 +513,11 @@ static void ct3d_config_write(PCIDevice *pci_dev, uint32_t addr, uint32_t val,
  */
 #define UI64_NULL ~(0ULL)
 
-static void build_dvsecs(CXLType3Dev *ct3d)
-{
+static void build_dvsecs(CXLType3Dev *ct3d) {
     CXLComponentState *cxl_cstate = &ct3d->cxl_cstate;
     uint8_t *dvsec;
-    uint32_t range1_size_hi, range1_size_lo,
-             range1_base_hi = 0, range1_base_lo = 0,
-             range2_size_hi = 0, range2_size_lo = 0,
-             range2_base_hi = 0, range2_base_lo = 0;
+    uint32_t range1_size_hi, range1_size_lo, range1_base_hi = 0, range1_base_lo = 0, range2_size_hi = 0,
+                                             range2_size_lo = 0, range2_base_hi = 0, range2_base_lo = 0;
 
     /*
      * Volatile memory is mapped as (0x0)
@@ -557,17 +525,14 @@ static void build_dvsecs(CXLType3Dev *ct3d)
      */
     if (ct3d->hostvmem) {
         range1_size_hi = ct3d->hostvmem->size >> 32;
-        range1_size_lo = (2 << 5) | (2 << 2) | 0x3 |
-                         (ct3d->hostvmem->size & 0xF0000000);
+        range1_size_lo = (2 << 5) | (2 << 2) | 0x3 | (ct3d->hostvmem->size & 0xF0000000);
         if (ct3d->hostpmem) {
             range2_size_hi = ct3d->hostpmem->size >> 32;
-            range2_size_lo = (2 << 5) | (2 << 2) | 0x3 |
-                             (ct3d->hostpmem->size & 0xF0000000);
+            range2_size_lo = (2 << 5) | (2 << 2) | 0x3 | (ct3d->hostpmem->size & 0xF0000000);
         }
     } else if (ct3d->hostpmem) {
         range1_size_hi = ct3d->hostpmem->size >> 32;
-        range1_size_lo = (2 << 5) | (2 << 2) | 0x3 |
-                         (ct3d->hostpmem->size & 0xF0000000);
+        range1_size_lo = (2 << 5) | (2 << 2) | 0x3 | (ct3d->hostpmem->size & 0xF0000000);
     } else {
         /*
          * For DCD with no static memory, set memory active, memory class bits.
@@ -590,43 +555,36 @@ static void build_dvsecs(CXLType3Dev *ct3d)
         .range2_base_hi = range2_base_hi,
         .range2_base_lo = range2_base_lo,
     };
-    cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE,
-                               PCIE_CXL_DEVICE_DVSEC_LENGTH,
-                               PCIE_CXL_DEVICE_DVSEC,
+    cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE, PCIE_CXL_DEVICE_DVSEC_LENGTH, PCIE_CXL_DEVICE_DVSEC,
                                PCIE_CXL31_DEVICE_DVSEC_REVID, dvsec);
 
     dvsec = (uint8_t *)&(CXLDVSECRegisterLocator){
-        .rsvd         = 0,
+        .rsvd = 0,
         .reg0_base_lo = RBI_COMPONENT_REG | CXL_COMPONENT_REG_BAR_IDX,
         .reg0_base_hi = 0,
         .reg1_base_lo = RBI_CXL_DEVICE_REG | CXL_DEVICE_REG_BAR_IDX,
         .reg1_base_hi = 0,
     };
-    cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE,
-                               REG_LOC_DVSEC_LENGTH, REG_LOC_DVSEC,
-                               REG_LOC_DVSEC_REVID, dvsec);
+    cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE, REG_LOC_DVSEC_LENGTH, REG_LOC_DVSEC, REG_LOC_DVSEC_REVID,
+                               dvsec);
     dvsec = (uint8_t *)&(CXLDVSECDeviceGPF){
         .phase2_duration = 0x603, /* 3 seconds */
         .phase2_power = 0x33, /* 0x33 miliwatts */
     };
-    cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE,
-                               GPF_DEVICE_DVSEC_LENGTH, GPF_DEVICE_DVSEC,
+    cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE, GPF_DEVICE_DVSEC_LENGTH, GPF_DEVICE_DVSEC,
                                GPF_DEVICE_DVSEC_REVID, dvsec);
 
     dvsec = (uint8_t *)&(CXLDVSECPortFlexBus){
-        .cap                     = 0x26, /* 68B, IO, Mem, non-MLD */
-        .ctrl                    = 0x02, /* IO always enabled */
-        .status                  = 0x26, /* same as capabilities */
+        .cap = 0x26, /* 68B, IO, Mem, non-MLD */
+        .ctrl = 0x02, /* IO always enabled */
+        .status = 0x26, /* same as capabilities */
         .rcvd_mod_ts_data_phase1 = 0xef, /* WTF? */
     };
-    cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE,
-                               PCIE_CXL3_FLEXBUS_PORT_DVSEC_LENGTH,
-                               PCIE_FLEXBUS_PORT_DVSEC,
-                               PCIE_CXL3_FLEXBUS_PORT_DVSEC_REVID, dvsec);
+    cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE, PCIE_CXL3_FLEXBUS_PORT_DVSEC_LENGTH,
+                               PCIE_FLEXBUS_PORT_DVSEC, PCIE_CXL3_FLEXBUS_PORT_DVSEC_REVID, dvsec);
 }
 
-static void hdm_decoder_commit(CXLType3Dev *ct3d, int which)
-{
+static void hdm_decoder_commit(CXLType3Dev *ct3d, int which) {
     int hdm_inc = R_CXL_HDM_DECODER1_BASE_LO - R_CXL_HDM_DECODER0_BASE_LO;
     ComponentRegisters *cregs = &ct3d->cxl_cstate.crb;
     uint32_t *cache_mem = cregs->cache_mem_registers;
@@ -640,8 +598,7 @@ static void hdm_decoder_commit(CXLType3Dev *ct3d, int which)
     stl_le_p(cache_mem + R_CXL_HDM_DECODER0_CTRL + which * hdm_inc, ctrl);
 }
 
-static void hdm_decoder_uncommit(CXLType3Dev *ct3d, int which)
-{
+static void hdm_decoder_uncommit(CXLType3Dev *ct3d, int which) {
     int hdm_inc = R_CXL_HDM_DECODER1_BASE_LO - R_CXL_HDM_DECODER0_BASE_LO;
     ComponentRegisters *cregs = &ct3d->cxl_cstate.crb;
     uint32_t *cache_mem = cregs->cache_mem_registers;
@@ -655,8 +612,7 @@ static void hdm_decoder_uncommit(CXLType3Dev *ct3d, int which)
     stl_le_p(cache_mem + R_CXL_HDM_DECODER0_CTRL + which * hdm_inc, ctrl);
 }
 
-static int ct3d_qmp_uncor_err_to_cxl(CxlUncorErrorType qmp_err)
-{
+static int ct3d_qmp_uncor_err_to_cxl(CxlUncorErrorType qmp_err) {
     switch (qmp_err) {
     case CXL_UNCOR_ERROR_TYPE_CACHE_DATA_PARITY:
         return CXL_RAS_UNC_ERR_CACHE_DATA_PARITY;
@@ -693,8 +649,7 @@ static int ct3d_qmp_uncor_err_to_cxl(CxlUncorErrorType qmp_err)
     }
 }
 
-static int ct3d_qmp_cor_err_to_cxl(CxlCorErrorType qmp_err)
-{
+static int ct3d_qmp_cor_err_to_cxl(CxlCorErrorType qmp_err) {
     switch (qmp_err) {
     case CXL_COR_ERROR_TYPE_CACHE_DATA_ECC:
         return CXL_RAS_COR_ERR_CACHE_DATA_ECC;
@@ -715,9 +670,7 @@ static int ct3d_qmp_cor_err_to_cxl(CxlCorErrorType qmp_err)
     }
 }
 
-static void ct3d_reg_write(void *opaque, hwaddr offset, uint64_t value,
-                           unsigned size)
-{
+static void ct3d_reg_write(void *opaque, hwaddr offset, uint64_t value, unsigned size) {
     CXLComponentState *cxl_cstate = opaque;
     ComponentRegisters *cregs = &cxl_cstate->crb;
     CXLType3Dev *ct3d = container_of(cxl_cstate, CXLType3Dev, cxl_cstate);
@@ -750,11 +703,9 @@ static void ct3d_reg_write(void *opaque, hwaddr offset, uint64_t value,
         should_uncommit = !should_commit;
         which_hdm = 3;
         break;
-    case A_CXL_RAS_UNC_ERR_STATUS:
-    {
+    case A_CXL_RAS_UNC_ERR_STATUS: {
         uint32_t capctrl = ldl_le_p(cache_mem + R_CXL_RAS_ERR_CAP_CTRL);
-        uint32_t fe = FIELD_EX32(capctrl, CXL_RAS_ERR_CAP_CTRL,
-                                 FIRST_ERROR_POINTER);
+        uint32_t fe = FIELD_EX32(capctrl, CXL_RAS_ERR_CAP_CTRL, FIRST_ERROR_POINTER);
         CXLError *cxl_err;
         uint32_t unc_err;
 
@@ -773,8 +724,7 @@ static void ct3d_reg_write(void *opaque, hwaddr offset, uint64_t value,
                  * closest to behavior of hardware not capable of multiple
                  * header recording.
                  */
-                QTAILQ_FOREACH_SAFE(cxl_err, &ct3d->error_list, node,
-                                    cxl_next) {
+                QTAILQ_FOREACH_SAFE(cxl_err, &ct3d->error_list, node, cxl_next) {
                     if ((1 << cxl_err->type) & value) {
                         QTAILQ_REMOVE(&ct3d->error_list, cxl_err, node);
                         g_free(cxl_err);
@@ -799,30 +749,24 @@ static void ct3d_reg_write(void *opaque, hwaddr offset, uint64_t value,
                 for (i = 0; i < CXL_RAS_ERR_HEADER_NUM; i++) {
                     stl_le_p(header_log + i, cxl_err->header[i]);
                 }
-                capctrl = FIELD_DP32(capctrl, CXL_RAS_ERR_CAP_CTRL,
-                                     FIRST_ERROR_POINTER, cxl_err->type);
+                capctrl = FIELD_DP32(capctrl, CXL_RAS_ERR_CAP_CTRL, FIRST_ERROR_POINTER, cxl_err->type);
             } else {
                 /*
                  * If no more errors, then follow recommendation of PCI spec
                  * r6.0 6.2.4.2 to set the first error pointer to a status
                  * bit that will never be used.
                  */
-                capctrl = FIELD_DP32(capctrl, CXL_RAS_ERR_CAP_CTRL,
-                                     FIRST_ERROR_POINTER,
-                                     CXL_RAS_UNC_ERR_CXL_UNUSED);
+                capctrl = FIELD_DP32(capctrl, CXL_RAS_ERR_CAP_CTRL, FIRST_ERROR_POINTER, CXL_RAS_UNC_ERR_CXL_UNUSED);
             }
             stl_le_p((uint8_t *)cache_mem + A_CXL_RAS_ERR_CAP_CTRL, capctrl);
         }
         unc_err = 0;
-        QTAILQ_FOREACH(cxl_err, &ct3d->error_list, node) {
-            unc_err |= 1 << cxl_err->type;
-        }
+        QTAILQ_FOREACH(cxl_err, &ct3d->error_list, node) { unc_err |= 1 << cxl_err->type; }
         stl_le_p((uint8_t *)cache_mem + offset, unc_err);
 
         return;
     }
-    case A_CXL_RAS_COR_ERR_STATUS:
-    {
+    case A_CXL_RAS_COR_ERR_STATUS: {
         uint32_t rw1c = value;
         uint32_t temp = ldl_le_p((uint8_t *)cache_mem + offset);
         temp &= ~rw1c;
@@ -845,8 +789,7 @@ static void ct3d_reg_write(void *opaque, hwaddr offset, uint64_t value,
  * TODO: dc region configuration will be updated once host backend and address
  * space support is added for DCD.
  */
-static bool cxl_create_dc_regions(CXLType3Dev *ct3d, Error **errp)
-{
+static bool cxl_create_dc_regions(CXLType3Dev *ct3d, Error **errp) {
     int i;
     uint64_t region_base = 0;
     uint64_t region_len;
@@ -863,14 +806,11 @@ static bool cxl_create_dc_regions(CXLType3Dev *ct3d, Error **errp)
     region_len = DIV_ROUND_UP(dc_size, ct3d->dc.num_regions);
 
     if (dc_size % (ct3d->dc.num_regions * CXL_CAPACITY_MULTIPLIER) != 0) {
-        error_setg(errp,
-                   "backend size is not multiple of region len: 0x%" PRIx64,
-                   region_len);
+        error_setg(errp, "backend size is not multiple of region len: 0x%" PRIx64, region_len);
         return false;
     }
     if (region_len % CXL_CAPACITY_MULTIPLIER != 0) {
-        error_setg(errp, "DC region size is unaligned to 0x%" PRIx64,
-                   CXL_CAPACITY_MULTIPLIER);
+        error_setg(errp, "DC region size is unaligned to 0x%" PRIx64, CXL_CAPACITY_MULTIPLIER);
         return false;
     }
     decode_len = region_len;
@@ -884,15 +824,12 @@ static bool cxl_create_dc_regions(CXLType3Dev *ct3d, Error **errp)
         region_base += memory_region_size(mr);
     }
     if (region_base % CXL_CAPACITY_MULTIPLIER != 0) {
-        error_setg(errp, "DC region base not aligned to 0x%" PRIx64,
-                   CXL_CAPACITY_MULTIPLIER);
+        error_setg(errp, "DC region base not aligned to 0x%" PRIx64, CXL_CAPACITY_MULTIPLIER);
         return false;
     }
 
-    for (i = 0, region = &ct3d->dc.regions[0];
-         i < ct3d->dc.num_regions;
-         i++, region++, region_base += region_len) {
-        *region = (CXLDCRegion) {
+    for (i = 0, region = &ct3d->dc.regions[0]; i < ct3d->dc.num_regions; i++, region++, region_base += region_len) {
+        *region = (CXLDCRegion){
             .base = region_base,
             .decode_len = decode_len,
             .len = region_len,
@@ -911,8 +848,7 @@ static bool cxl_create_dc_regions(CXLType3Dev *ct3d, Error **errp)
     return true;
 }
 
-static void cxl_destroy_dc_regions(CXLType3Dev *ct3d)
-{
+static void cxl_destroy_dc_regions(CXLType3Dev *ct3d) {
     CXLDCExtent *ent, *ent_next;
     CXLDCExtentGroup *group, *group_next;
     int i;
@@ -936,12 +872,10 @@ static void cxl_destroy_dc_regions(CXLType3Dev *ct3d)
     }
 }
 
-static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
-{
+static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp) {
     DeviceState *ds = DEVICE(ct3d);
 
-    if (!ct3d->hostmem && !ct3d->hostvmem && !ct3d->hostpmem
-        && !ct3d->dc.num_regions) {
+    if (!ct3d->hostmem && !ct3d->hostvmem && !ct3d->hostpmem && !ct3d->dc.num_regions) {
         error_setg(errp, "at least one memdev property must be set");
         return false;
     } else if (ct3d->hostmem && ct3d->hostpmem) {
@@ -970,7 +904,7 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
         }
         if (host_memory_backend_is_mapped(ct3d->hostvmem)) {
             error_setg(errp, "memory backend %s can't be used multiple times.",
-               object_get_canonical_path_component(OBJECT(ct3d->hostvmem)));
+                       object_get_canonical_path_component(OBJECT(ct3d->hostvmem)));
             return false;
         }
         memory_region_set_nonvolatile(vmr, false);
@@ -984,8 +918,7 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
         address_space_init(&ct3d->hostvmem_as, vmr, v_name);
         ct3d->cxl_dstate.vmem_size = memory_region_size(vmr);
         ct3d->cxl_dstate.static_mem_size += memory_region_size(vmr);
-        info_report("CXL Type3: Volatile memory initialized - size=%lu MB", 
-                   memory_region_size(vmr) / (1024*1024));
+        info_report("CXL Type3: Volatile memory initialized - size=%lu MB", memory_region_size(vmr) / (1024 * 1024));
         g_free(v_name);
     }
 
@@ -1000,7 +933,7 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
         }
         if (host_memory_backend_is_mapped(ct3d->hostpmem)) {
             error_setg(errp, "memory backend %s can't be used multiple times.",
-               object_get_canonical_path_component(OBJECT(ct3d->hostpmem)));
+                       object_get_canonical_path_component(OBJECT(ct3d->hostpmem)));
             return false;
         }
         memory_region_set_nonvolatile(pmr, true);
@@ -1014,8 +947,7 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
         address_space_init(&ct3d->hostpmem_as, pmr, p_name);
         ct3d->cxl_dstate.pmem_size = memory_region_size(pmr);
         ct3d->cxl_dstate.static_mem_size += memory_region_size(pmr);
-        info_report("CXL Type3: Persistent memory initialized - size=%lu MB",
-                   memory_region_size(pmr) / (1024*1024));
+        info_report("CXL Type3: Persistent memory initialized - size=%lu MB", memory_region_size(pmr) / (1024 * 1024));
         g_free(p_name);
     }
 
@@ -1037,7 +969,7 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
 
         if (host_memory_backend_is_mapped(ct3d->dc.host_dc)) {
             error_setg(errp, "memory backend %s can't be used multiple times.",
-               object_get_canonical_path_component(OBJECT(ct3d->dc.host_dc)));
+                       object_get_canonical_path_component(OBJECT(ct3d->dc.host_dc)));
             return false;
         }
         /*
@@ -1064,26 +996,19 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
     return true;
 }
 
-static DOEProtocol doe_cdat_prot[] = {
-    { CXL_VENDOR_ID, CXL_DOE_TABLE_ACCESS, cxl_doe_cdat_rsp },
-    { }
-};
+static DOEProtocol doe_cdat_prot[] = {{CXL_VENDOR_ID, CXL_DOE_TABLE_ACCESS, cxl_doe_cdat_rsp}, {}};
 
 /* Initialize CXL device alerts with default threshold values. */
-static void init_alert_config(CXLType3Dev *ct3d)
-{
-    ct3d->alert_config = (CXLAlertConfig) {
-        .life_used_crit_alert_thresh = 75,
-        .life_used_warn_thresh = 40,
-        .over_temp_crit_alert_thresh = 35,
-        .under_temp_crit_alert_thresh = 10,
-        .over_temp_warn_thresh = 25,
-        .under_temp_warn_thresh = 20
-    };
+static void init_alert_config(CXLType3Dev *ct3d) {
+    ct3d->alert_config = (CXLAlertConfig){.life_used_crit_alert_thresh = 75,
+                                          .life_used_warn_thresh = 40,
+                                          .over_temp_crit_alert_thresh = 35,
+                                          .under_temp_crit_alert_thresh = 10,
+                                          .over_temp_warn_thresh = 25,
+                                          .under_temp_warn_thresh = 20};
 }
 
-static void ct3_realize(PCIDevice *pci_dev, Error **errp)
-{
+static void ct3_realize(PCIDevice *pci_dev, Error **errp) {
     ERRP_GUARD();
     CXLType3Dev *ct3d = CXL_TYPE3(pci_dev);
     CXLComponentState *cxl_cstate = &ct3d->cxl_cstate;
@@ -1115,18 +1040,13 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
     regs->special_ops = g_new0(MemoryRegionOps, 1);
     regs->special_ops->write = ct3d_reg_write;
 
-    cxl_component_register_block_init(OBJECT(pci_dev), cxl_cstate,
-                                      TYPE_CXL_TYPE3);
+    cxl_component_register_block_init(OBJECT(pci_dev), cxl_cstate, TYPE_CXL_TYPE3);
 
-    pci_register_bar(
-        pci_dev, CXL_COMPONENT_REG_BAR_IDX,
-        PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64, mr);
+    pci_register_bar(pci_dev, CXL_COMPONENT_REG_BAR_IDX, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64,
+                     mr);
 
-    cxl_device_register_block_init(OBJECT(pci_dev), &ct3d->cxl_dstate,
-                                   &ct3d->cci);
-    pci_register_bar(pci_dev, CXL_DEVICE_REG_BAR_IDX,
-                     PCI_BASE_ADDRESS_SPACE_MEMORY |
-                         PCI_BASE_ADDRESS_MEM_TYPE_64,
+    cxl_device_register_block_init(OBJECT(pci_dev), &ct3d->cxl_dstate, &ct3d->cci);
+    pci_register_bar(pci_dev, CXL_DEVICE_REG_BAR_IDX, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64,
                      &ct3d->cxl_dstate.device_registers);
 
     /* MSI(-X) Initialization */
@@ -1139,8 +1059,7 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
     }
 
     /* DOE Initialization */
-    pcie_doe_init(pci_dev, &ct3d->doe_cdat, 0x190, doe_cdat_prot, true,
-                  CXL_T3_MSIX_PCIE_DOE_TABLE_ACCESS);
+    pcie_doe_init(pci_dev, &ct3d->doe_cdat, 0x190, doe_cdat_prot, true, CXL_T3_MSIX_PCIE_DOE_TABLE_ACCESS);
 
     cxl_cstate->cdat.build_cdat_table = ct3_build_cdat_table;
     cxl_cstate->cdat.free_cdat_table = ct3_free_cdat_table;
@@ -1160,26 +1079,20 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
 
     /* Set default value for patrol scrub attributes */
     ct3d->patrol_scrub_attrs.scrub_cycle_cap =
-                           CXL_MEMDEV_PS_SCRUB_CYCLE_CHANGE_CAP_DEFAULT |
-                           CXL_MEMDEV_PS_SCRUB_REALTIME_REPORT_CAP_DEFAULT;
+        CXL_MEMDEV_PS_SCRUB_CYCLE_CHANGE_CAP_DEFAULT | CXL_MEMDEV_PS_SCRUB_REALTIME_REPORT_CAP_DEFAULT;
     ct3d->patrol_scrub_attrs.scrub_cycle =
-                           CXL_MEMDEV_PS_CUR_SCRUB_CYCLE_DEFAULT |
-                           (CXL_MEMDEV_PS_MIN_SCRUB_CYCLE_DEFAULT << 8);
+        CXL_MEMDEV_PS_CUR_SCRUB_CYCLE_DEFAULT | (CXL_MEMDEV_PS_MIN_SCRUB_CYCLE_DEFAULT << 8);
     ct3d->patrol_scrub_attrs.scrub_flags = CXL_MEMDEV_PS_ENABLE_DEFAULT;
 
     /* Set default value for DDR5 ECS read attributes */
     ct3d->ecs_attrs.ecs_log_cap = CXL_ECS_LOG_ENTRY_TYPE_DEFAULT;
     for (count = 0; count < CXL_ECS_NUM_MEDIA_FRUS; count++) {
-        ct3d->ecs_attrs.fru_attrs[count].ecs_cap =
-                            CXL_ECS_REALTIME_REPORT_CAP_DEFAULT;
-        ct3d->ecs_attrs.fru_attrs[count].ecs_config =
-                            CXL_ECS_THRESHOLD_COUNT_DEFAULT |
-                            (CXL_ECS_MODE_DEFAULT << 3);
+        ct3d->ecs_attrs.fru_attrs[count].ecs_cap = CXL_ECS_REALTIME_REPORT_CAP_DEFAULT;
+        ct3d->ecs_attrs.fru_attrs[count].ecs_config = CXL_ECS_THRESHOLD_COUNT_DEFAULT | (CXL_ECS_MODE_DEFAULT << 3);
         /* Reserved */
         ct3d->ecs_attrs.fru_attrs[count].ecs_flags = 0;
     }
 
-   
     return;
 
 err_release_cdat:
@@ -1200,8 +1113,7 @@ err_free_special_ops:
     }
 }
 
-static void ct3_exit(PCIDevice *pci_dev)
-{
+static void ct3_exit(PCIDevice *pci_dev) {
     CXLType3Dev *ct3d = CXL_TYPE3(pci_dev);
     CXLComponentState *cxl_cstate = &ct3d->cxl_cstate;
     ComponentRegisters *regs = &cxl_cstate->crb;
@@ -1238,9 +1150,7 @@ static void ct3_exit(PCIDevice *pci_dev)
  * Mark the DPA range [dpa, dap + len - 1] to be backed and accessible. This
  * happens when a DC extent is added and accepted by the host.
  */
-void ct3_set_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
-                                 uint64_t len)
-{
+void ct3_set_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa, uint64_t len) {
     CXLDCRegion *region;
 
     region = cxl_find_dc_region(ct3d, dpa, len);
@@ -1249,17 +1159,14 @@ void ct3_set_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
     }
 
     QEMU_LOCK_GUARD(&region->bitmap_lock);
-    bitmap_set(region->blk_bitmap, (dpa - region->base) / region->block_size,
-               len / region->block_size);
+    bitmap_set(region->blk_bitmap, (dpa - region->base) / region->block_size, len / region->block_size);
 }
 
 /*
  * Check whether the DPA range [dpa, dpa + len - 1] is backed with DC extents.
  * Used when validating read/write to dc regions
  */
-bool ct3_test_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
-                                  uint64_t len)
-{
+bool ct3_test_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa, uint64_t len) {
     CXLDCRegion *region;
     uint64_t nbits;
     long nr;
@@ -1283,9 +1190,7 @@ bool ct3_test_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
  * Mark the DPA range [dpa, dap + len - 1] to be unbacked and inaccessible.
  * This happens when a dc extent is released by the host.
  */
-void ct3_clear_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
-                                   uint64_t len)
-{
+void ct3_clear_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa, uint64_t len) {
     CXLDCRegion *region;
     uint64_t nbits;
     long nr;
@@ -1301,8 +1206,7 @@ void ct3_clear_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
     bitmap_clear(region->blk_bitmap, nr, nbits);
 }
 
-static bool cxl_type3_dpa(CXLType3Dev *ct3d, hwaddr host_addr, uint64_t *dpa)
-{
+static bool cxl_type3_dpa(CXLType3Dev *ct3d, hwaddr host_addr, uint64_t *dpa) {
     int hdm_inc = R_CXL_HDM_DECODER1_BASE_LO - R_CXL_HDM_DECODER0_BASE_LO;
     uint32_t *cache_mem = ct3d->cxl_cstate.crb.cache_mem_registers;
     unsigned int hdm_count;
@@ -1311,9 +1215,7 @@ static bool cxl_type3_dpa(CXLType3Dev *ct3d, hwaddr host_addr, uint64_t *dpa)
     int i;
 
     cap = ldl_le_p(cache_mem + R_CXL_HDM_DECODER_CAPABILITY);
-    hdm_count = cxl_decoder_count_dec(FIELD_EX32(cap,
-                                                 CXL_HDM_DECODER_CAPABILITY,
-                                                 DECODER_COUNT));
+    hdm_count = cxl_decoder_count_dec(FIELD_EX32(cap, CXL_HDM_DECODER_CAPABILITY, DECODER_COUNT));
 
     for (i = 0; i < hdm_count; i++) {
         uint64_t decoder_base, decoder_size, hpa_offset, skip;
@@ -1328,10 +1230,8 @@ static bool cxl_type3_dpa(CXLType3Dev *ct3d, hwaddr host_addr, uint64_t *dpa)
         high = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_SIZE_HI + i * hdm_inc);
         decoder_size = ((uint64_t)high << 32) | (low & 0xf0000000);
 
-        low = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_DPA_SKIP_LO +
-                       i * hdm_inc);
-        high = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_DPA_SKIP_HI +
-                        i * hdm_inc);
+        low = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_DPA_SKIP_LO + i * hdm_inc);
+        high = ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_DPA_SKIP_HI + i * hdm_inc);
         skip = ((uint64_t)high << 32) | (low & 0xf0000000);
         dpa_base += skip;
 
@@ -1343,8 +1243,7 @@ static bool cxl_type3_dpa(CXLType3Dev *ct3d, hwaddr host_addr, uint64_t *dpa)
         if (!FIELD_EX32(hdm_ctrl, CXL_HDM_DECODER0_CTRL, COMMITTED)) {
             return false;
         }
-        if (((uint64_t)host_addr < decoder_base) ||
-            (hpa_offset >= decoder_size)) {
+        if (((uint64_t)host_addr < decoder_base) || (hpa_offset >= decoder_size)) {
             int decoded_iw = cxl_interleave_ways_dec(iw, &error_fatal);
 
             if (decoded_iw == 0) {
@@ -1356,15 +1255,12 @@ static bool cxl_type3_dpa(CXLType3Dev *ct3d, hwaddr host_addr, uint64_t *dpa)
         }
 
         if (iw < 8) {
-            *dpa = dpa_base +
-                ((MAKE_64BIT_MASK(0, 8 + ig) & hpa_offset) |
-                 ((MAKE_64BIT_MASK(8 + ig + iw, 64 - 8 - ig - iw) & hpa_offset)
-                  >> iw));
+            *dpa = dpa_base + ((MAKE_64BIT_MASK(0, 8 + ig) & hpa_offset) |
+                               ((MAKE_64BIT_MASK(8 + ig + iw, 64 - 8 - ig - iw) & hpa_offset) >> iw));
         } else {
-            *dpa = dpa_base +
-                ((MAKE_64BIT_MASK(0, 8 + ig) & hpa_offset) |
-                 ((((MAKE_64BIT_MASK(ig + iw, 64 - ig - iw) & hpa_offset)
-                   >> (ig + iw)) / 3) << (ig + 8)));
+            *dpa =
+                dpa_base + ((MAKE_64BIT_MASK(0, 8 + ig) & hpa_offset) |
+                            ((((MAKE_64BIT_MASK(ig + iw, 64 - ig - iw) & hpa_offset) >> (ig + iw)) / 3) << (ig + 8)));
         }
 
         return true;
@@ -1372,12 +1268,8 @@ static bool cxl_type3_dpa(CXLType3Dev *ct3d, hwaddr host_addr, uint64_t *dpa)
     return false;
 }
 
-static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
-                                       hwaddr host_addr,
-                                       unsigned int size,
-                                       AddressSpace **as,
-                                       uint64_t *dpa_offset)
-{
+static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d, hwaddr host_addr, unsigned int size, AddressSpace **as,
+                                       uint64_t *dpa_offset) {
     MemoryRegion *vmr = NULL, *pmr = NULL, *dc_mr = NULL;
     uint64_t vmr_size = 0, pmr_size = 0, dc_size = 0;
 
@@ -1423,45 +1315,42 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
     return 0;
 }
 
-
-                
-
-
-
 // Helper to calculate log2 for bit shifting
 uint32_t intLog2(uint32_t n) {
     uint32_t target = 0;
-    while (n >>= 1) ++target;
+    while (n >>= 1)
+        ++target;
     return target;
 }
 
-MemSimCache* cache_create(uint32_t num_sets, uint32_t assoc, uint32_t line_size) {
-    uint8_t test_pattern[16] = {0xDE, 0xAD, 0xBE, 0xEF, 0xBA, 0xAD, 0xF0, 0x0D, 0xCA, 0xFE, 0xBA, 0xBE, 0xFE, 0xED, 0xFA, 0xCE};
-    MemSimCache* memsim_cache = (MemSimCache*)malloc(sizeof(MemSimCache));
+MemSimCache *cache_create(uint32_t num_sets, uint32_t assoc, uint32_t line_size) {
+    uint8_t test_pattern[16] = {0xDE, 0xAD, 0xBE, 0xEF, 0xBA, 0xAD, 0xF0, 0x0D,
+                                0xCA, 0xFE, 0xBA, 0xBE, 0xFE, 0xED, 0xFA, 0xCE};
+    MemSimCache *memsim_cache = (MemSimCache *)malloc(sizeof(MemSimCache));
     memsim_cache->num_sets = num_sets;
     memsim_cache->assoc = assoc;
     memsim_cache->line_size = line_size;
-    memsim_cache->sets = (MemSimCacheSet*)malloc(sizeof(MemSimCacheSet) * num_sets);
+    memsim_cache->sets = (MemSimCacheSet *)malloc(sizeof(MemSimCacheSet) * num_sets);
 
     for (uint32_t i = 0; i < num_sets; ++i) {
-        memsim_cache->sets[i].lines = (MemSimCacheLine*)malloc(sizeof(MemSimCacheLine) * assoc);
+        memsim_cache->sets[i].lines = (MemSimCacheLine *)malloc(sizeof(MemSimCacheLine) * assoc);
         memsim_cache->sets[i].fifo_ptr = 0;
         memsim_cache->sets[i].occupancy = 0;
         for (uint32_t j = 0; j < assoc; ++j) {
             memsim_cache->sets[i].lines[j].tag = 0;
             memsim_cache->sets[i].lines[j].mesi_state = MESI_INVALID;
-            memsim_cache->sets[i].lines[j].data = (uint8_t*)malloc(line_size);
+            memsim_cache->sets[i].lines[j].data = (uint8_t *)malloc(line_size);
             if (pthread_mutex_init(&memsim_cache->sets[i].lines[j].lock, NULL) != 0) {
                 qemu_log("%s: failed to initialize mutex for cache line %u in set %u\n", __func__, j, i);
             }
-            memcpy(memsim_cache->sets[i].lines[j].data, test_pattern, 
-                   line_size < sizeof(test_pattern) ? line_size : sizeof(test_pattern) );
+            memcpy(memsim_cache->sets[i].lines[j].data, test_pattern,
+                   line_size < sizeof(test_pattern) ? line_size : sizeof(test_pattern));
         }
     }
     return memsim_cache;
 }
 
-void cache_destroy(MemSimCache* memsim_cache) {
+void cache_destroy(MemSimCache *memsim_cache) {
     for (uint32_t i = 0; i < memsim_cache->num_sets; ++i) {
         for (uint32_t j = 0; j < memsim_cache->assoc; ++j) {
             free(memsim_cache->sets[i].lines[j].data);
@@ -1474,132 +1363,130 @@ void cache_destroy(MemSimCache* memsim_cache) {
     return;
 }
 
-void cache_read(MemSimCache* memsim_cache, uint64_t dpa_addr, uint64_t* data, MemSimCacheState *mesi_state, bool* hit) {
+void cache_read(MemSimCache *memsim_cache, uint64_t dpa_addr, uint64_t *data, MemSimCacheState *mesi_state, bool *hit) {
     uint32_t offset_bits = intLog2(memsim_cache->line_size);
     uint32_t index_bits = intLog2(memsim_cache->num_sets);
-    
+
     uint64_t set_no = (dpa_addr >> offset_bits) % memsim_cache->num_sets;
-    uint64_t tag    = (dpa_addr >> (offset_bits + index_bits));
+    uint64_t tag = (dpa_addr >> (offset_bits + index_bits));
 
     // Lock Supporting Variables
     struct timespec abs_time;
     int rc;
 
-    #ifdef DEBUG_CXL_MEMSIM
-    qemu_log("%s: dpa 0x%lx, set %lu, tag 0x%lx\n",
-             __func__, dpa_addr, set_no, tag);
-    #endif
-    MemSimCacheSet* set = &memsim_cache->sets[set_no];
-    
+#ifdef DEBUG_CXL_MEMSIM
+    qemu_log("%s: dpa 0x%lx, set %lu, tag 0x%lx\n", __func__, dpa_addr, set_no, tag);
+#endif
+    MemSimCacheSet *set = &memsim_cache->sets[set_no];
+
     for (uint32_t i = 0; i < memsim_cache->assoc; ++i) {
         // Check Lock
         clock_gettime(CLOCK_REALTIME, &abs_time);
         abs_time.tv_sec += 5; // Wait for 5 seconds max
-        #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
         qemu_log("%s: attempting to lock cache line %d in set %lu\n", __func__, i, set_no);
-        #endif
+#endif
         rc = pthread_mutex_timedlock(&set->lines[i].lock, &abs_time);
-        #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
         qemu_log("%s: lock result for cache line %d in set %lu: %d\n", __func__, i, set_no, rc);
-        #endif
+#endif
         if (rc == ETIMEDOUT) {
             qemu_log("%s: [ERROR] line.lock time out. cache line %d, set %lu\n", __func__, i, set_no);
             abort();
         }
         if (set->lines[i].mesi_state != MESI_INVALID && set->lines[i].tag == tag) {
-            memcpy((void*)data, (void*)set->lines[i].data, memsim_cache->line_size);
+            memcpy((void *)data, (void *)set->lines[i].data, memsim_cache->line_size);
             *mesi_state = set->lines[i].mesi_state;
             *hit = true;
             pthread_mutex_unlock(&set->lines[i].lock);
-            #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
             qemu_log("%s: unlocked cache line %d in set %lu\n", __func__, i, set_no);
-            #endif
+#endif
             return;
         }
         pthread_mutex_unlock(&set->lines[i].lock);
-        #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
         qemu_log("%s: unlocked cache line %d in set %lu\n", __func__, i, set_no);
-        #endif
+#endif
     }
     *mesi_state = MESI_INVALID;
     *hit = false;
     return;
 }
 
-
-void change_cache_state(MemSimCache* memsim_cache, uint64_t dpa_addr, MemSimCacheState new_state) {
+void change_cache_state(MemSimCache *memsim_cache, uint64_t dpa_addr, MemSimCacheState new_state) {
     uint32_t offset_bits = intLog2(memsim_cache->line_size);
     uint32_t index_bits = intLog2(memsim_cache->num_sets);
-    
+
     uint64_t set_no = (dpa_addr >> offset_bits) % memsim_cache->num_sets;
-    uint64_t tag    = (dpa_addr >> (offset_bits + index_bits));
-    
+    uint64_t tag = (dpa_addr >> (offset_bits + index_bits));
+
     // Lock Supporting Variables
     struct timespec abs_time;
-    int rc; 
-    #ifdef DEBUG_CXL_MEMSIM
-    qemu_log("%s: change cache state - dpa 0x%lx, set %lu, tag 0x%lx, new state %d\n",
-             __func__, dpa_addr, set_no, tag, new_state);
-    #endif
+    int rc;
+#ifdef DEBUG_CXL_MEMSIM
+    qemu_log("%s: change cache state - dpa 0x%lx, set %lu, tag 0x%lx, new state %d\n", __func__, dpa_addr, set_no, tag,
+             new_state);
+#endif
 
-    MemSimCacheSet* set = &memsim_cache->sets[set_no];
+    MemSimCacheSet *set = &memsim_cache->sets[set_no];
 
     // Search the set for the tag
-    
+
     for (uint32_t i = 0; i < memsim_cache->assoc; ++i) {
         // We only care about valid lines
         clock_gettime(CLOCK_REALTIME, &abs_time);
         abs_time.tv_sec += 5; // Wait for 5 seconds max
-        #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
         qemu_log("%s: attempting to lock cache line %d in set %lu\n", __func__, i, set_no);
-        #endif
+#endif
         rc = pthread_mutex_timedlock(&set->lines[i].lock, &abs_time);
-        #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
         qemu_log("%s: lock result for cache line %d in set %lu: %d\n", __func__, i, set_no, rc);
-        #endif
+#endif
         if (rc == ETIMEDOUT) {
             qemu_log("%s: [ERROR] line.lock time out. cache line %d, set %lu\n", __func__, i, set_no);
             abort();
         }
         if (set->lines[i].mesi_state != MESI_INVALID && set->lines[i].tag == tag) {
-            // Apply the new MESI state   
+            // Apply the new MESI state
             set->lines[i].mesi_state = new_state;
             pthread_mutex_unlock(&set->lines[i].lock);
-            #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
             qemu_log("%s: unlocked cache line %d in set %lu\n", __func__, i, set_no);
-            #endif
+#endif
             return;
         }
         pthread_mutex_unlock(&set->lines[i].lock);
-        #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
         qemu_log("%s: unlocked cache line %d in set %lu\n", __func__, i, set_no);
-        #endif
+#endif
     }
     return;
 }
 
-void cache_write(MemSimCache* memsim_cache, uint64_t dpa_addr, uint64_t* data, uint64_t write_size) {
+void cache_write(MemSimCache *memsim_cache, uint64_t dpa_addr, uint64_t *data, uint64_t write_size) {
     uint32_t offset_bits = intLog2(memsim_cache->line_size);
     uint32_t index_bits = intLog2(memsim_cache->num_sets);
-    
+
     uint64_t set_no = (dpa_addr >> offset_bits) % memsim_cache->num_sets;
-    uint64_t tag    = (dpa_addr >> (offset_bits + index_bits));
+    uint64_t tag = (dpa_addr >> (offset_bits + index_bits));
     uint64_t block_idx = dpa_addr & (memsim_cache->line_size - 1);
-    
-    MemSimCacheSet* set = &memsim_cache->sets[set_no];
+
+    MemSimCacheSet *set = &memsim_cache->sets[set_no];
     int target_way = -1;
 
     // Timed Locking Supporting Variables
     struct timespec abs_time;
     int rc;
 
-    #ifdef DEBUG_CXL_MEMSIM
-    qemu_log("%s: dpa 0x%lx, set %lu, tag 0x%lx, block-idx %lu, write-size %lu\n",
-             __func__, dpa_addr, set_no, tag, block_idx, write_size);
-    #endif       
+#ifdef DEBUG_CXL_MEMSIM
+    qemu_log("%s: dpa 0x%lx, set %lu, tag 0x%lx, block-idx %lu, write-size %lu\n", __func__, dpa_addr, set_no, tag,
+             block_idx, write_size);
+#endif
     if (block_idx + write_size > memsim_cache->line_size) {
-        qemu_log("%s: [ERROR] Cache write would overflow! block_idx=%lu, write_size=%lu, line_size=%u\n",
-                 __func__, block_idx, write_size, memsim_cache->line_size);
+        qemu_log("%s: [ERROR] Cache write would overflow! block_idx=%lu, write_size=%lu, line_size=%u\n", __func__,
+                 block_idx, write_size, memsim_cache->line_size);
         return;
     }
 
@@ -1607,13 +1494,13 @@ void cache_write(MemSimCache* memsim_cache, uint64_t dpa_addr, uint64_t* data, u
     for (uint32_t i = 0; i < memsim_cache->assoc; ++i) {
         clock_gettime(CLOCK_REALTIME, &abs_time);
         abs_time.tv_sec += 5; // Wait for 1 second max
-        #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
         qemu_log("%s: attempting to lock cache line %d in set %lu\n", __func__, i, set_no);
-        #endif
+#endif
         rc = pthread_mutex_timedlock(&set->lines[i].lock, &abs_time);
-        #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
         qemu_log("%s: lock result for cache line %d in set %lu: %d\n", __func__, i, set_no, rc);
-        #endif
+#endif
         if (rc == ETIMEDOUT) {
             qemu_log("%s: [ERROR] line.lock time out. cache line %d, set %lu\n", __func__, i, set_no);
             abort();
@@ -1621,23 +1508,23 @@ void cache_write(MemSimCache* memsim_cache, uint64_t dpa_addr, uint64_t* data, u
         if (set->lines[i].mesi_state != MESI_INVALID && set->lines[i].tag == tag) {
             target_way = i;
             set->lines[i].mesi_state = MESI_MODIFIED; // Writing implies MODIFIED state
-            if (write_size == memsim_cache->line_size) { 
-                memcpy((void*)set->lines[target_way].data, (void*)data, memsim_cache->line_size); 
+            if (write_size == memsim_cache->line_size) {
+                memcpy((void *)set->lines[target_way].data, (void *)data, memsim_cache->line_size);
             } else {
-                memcpy(((void*)set->lines[target_way].data) + block_idx, (void*)data, write_size);
+                memcpy(((void *)set->lines[target_way].data) + block_idx, (void *)data, write_size);
                 // Transition to MODIFIED because the cache now has data memory doesn't
                 set->lines[target_way].mesi_state = MESI_MODIFIED;
             }
             pthread_mutex_unlock(&set->lines[i].lock);
-            #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
             qemu_log("%s: unlocked cache line %d in set %lu\n", __func__, i, set_no);
-            #endif
+#endif
             return;
         }
         pthread_mutex_unlock(&set->lines[i].lock);
-        #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
         qemu_log("%s: unlocked cache line %d in set %lu\n", __func__, i, set_no);
-        #endif
+#endif
     }
 
     // 2. Handle Miss
@@ -1648,63 +1535,64 @@ void cache_write(MemSimCache* memsim_cache, uint64_t dpa_addr, uint64_t* data, u
             set->occupancy++;
         } else {
             target_way = set->fifo_ptr;
-            MemSimCacheLine* victim = &set->lines[target_way];
+            MemSimCacheLine *victim = &set->lines[target_way];
 
-            // Send a request to the device to indicate invalidation even for exclusive line because it needs to remove snoop-filter entry
+            // Send a request to the device to indicate invalidation even for exclusive line because it needs to remove
+            // snoop-filter entry
             if (victim->mesi_state != MESI_INVALID) {
                 uint64_t wb_addr = (victim->tag << (index_bits + offset_bits)) | (set_no << offset_bits);
-                #ifdef VERBOSE_CXL_MEMSIM
+#ifdef VERBOSE_CXL_MEMSIM
                 qemu_log("%s: Cache Write-Back for DPA Address 0x%lx\n", __func__, wb_addr);
-                #endif
+#endif
 
-                #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
                 qemu_log("%s: Writing back data: ", __func__);
-                for (uint32_t i = 0; i < memsim_cache->line_size
-                        ; ++i) {
-                        qemu_log("%02x ", victim->data[i]);
-                    }
+                for (uint32_t i = 0; i < memsim_cache->line_size; ++i) {
+                    qemu_log("%02x ", victim->data[i]);
+                }
                 qemu_log("\n");
-                #endif
+#endif
 
                 // We pass the existing victim data back to the simulator
                 CXLMemSimResponse resp = {0};
-                if (cxl_memsim_request(OP_TYPE_WRITE, wb_addr, memsim_cache->line_size, (void*)victim->data, SnpTypeNOOP, MESI_INVALID, &resp)) {
+                if (cxl_memsim_request(OP_TYPE_WRITE, wb_addr, memsim_cache->line_size, (void *)victim->data,
+                                       SnpTypeNOOP, MESI_INVALID, &resp)) {
                     qemu_log("%s: [ERROR] Cache Write-Back failed for DPA Address 0x%lx\n", __func__, wb_addr);
                 }; // MemWr to Write-Back
             }
-            
+
             // Advance FIFO pointer for the next eviction
             set->fifo_ptr = (set->fifo_ptr + 1) % memsim_cache->assoc;
         }
         clock_gettime(CLOCK_REALTIME, &abs_time);
         abs_time.tv_sec += 5; // Wait for 1 second max
-        #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
         qemu_log("%s: attempting to lock cache line %d in set %lu\n", __func__, target_way, set_no);
-        #endif
+#endif
         rc = pthread_mutex_timedlock(&set->lines[target_way].lock, &abs_time);
-        #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
         qemu_log("%s: lock result for cache line %d in set %lu: %d\n", __func__, target_way, set_no, rc);
-        #endif
+#endif
         if (rc == ETIMEDOUT) {
             qemu_log("%s: [ERROR] line.lock time out. cache line %d, set %lu\n", __func__, target_way, set_no);
             abort();
         }
         // 3. Allocate and Setup the new entry
         set->lines[target_way].tag = tag;
-        // Since it's a new entry and we are writing to it, it starts as EXCLUSIVE 
+        // Since it's a new entry and we are writing to it, it starts as EXCLUSIVE
         set->lines[target_way].mesi_state = MESI_EXCLUSIVE;
 
         // 4. Perform the Write (Newly Allocated Miss)
-        if (write_size == memsim_cache->line_size) { 
-            memcpy((void*)set->lines[target_way].data, (void*)data, memsim_cache->line_size); 
+        if (write_size == memsim_cache->line_size) {
+            memcpy((void *)set->lines[target_way].data, (void *)data, memsim_cache->line_size);
         } else {
-            memcpy(((void*)set->lines[target_way].data) + block_idx, (void*)data, write_size);
+            memcpy(((void *)set->lines[target_way].data) + block_idx, (void *)data, write_size);
             set->lines[target_way].mesi_state = MESI_MODIFIED;
         }
         pthread_mutex_unlock(&set->lines[target_way].lock);
-        #ifdef DEBUG_CXL_MEMSIM
+#ifdef DEBUG_CXL_MEMSIM
         qemu_log("%s: unlocked cache line %d in set %lu\n", __func__, target_way, set_no);
-        #endif
+#endif
         return;
     }
 
@@ -1713,37 +1601,32 @@ void cache_write(MemSimCache* memsim_cache, uint64_t dpa_addr, uint64_t* data, u
 
 /* Ends QEMU Cache Emulation for CPUs */
 
-
-
-
-
 static void cxl_memsim_init(void) {
     /* Use double-checked locking for thread safety */
     if (g_memsim.initialized) {
         return;
     }
-    
-    pthread_mutex_lock(&g_memsim.lock);  
-    
+
+    pthread_mutex_lock(&g_memsim.lock);
+
     /* Check again under lock */
     if (g_memsim.initialized) {
         pthread_mutex_unlock(&g_memsim.lock);
         return;
     }
-    
+
     info_report("CXL Type3: Initializing CXLMemSim integration");
 
     qemu_log("%s: Initializing CXLMemSim integration\n", __func__);
 
-
     const char *host = getenv("CXL_MEMSIM_HOST");
     const char *port_str = getenv("CXL_MEMSIM_PORT");
     const char *transport = getenv("CXL_TRANSPORT_MODE");
-    
+    const char *file_transport_path = getenv("CXL_MEMSIM_IPC_FILE");
 
     int num_sets = 2048;
     int assoc = 15;
-    int line_size = 64; 
+    int line_size = 64;
     const char *sets_env = getenv("CXL_MEMSIM_CACHE_SETS");
     const char *assoc_env = getenv("CXL_MEMSIM_CACHE_ASSOC");
     const char *line_env = getenv("CXL_MEMSIM_CACHE_LINE_SIZE");
@@ -1760,13 +1643,12 @@ static void cxl_memsim_init(void) {
     g_memsim.cache = cache_create(num_sets, assoc, line_size);
     pthread_mutex_unlock(&g_memsim.cache_lock);
 
-
     if (!transport || !transport[0]) {
         transport = getenv("CXL_MEMSIM_TRANSPORT");
     }
     const char *rdma_server = getenv("CXL_MEMSIM_RDMA_SERVER");
     const char *rdma_port = getenv("CXL_MEMSIM_RDMA_PORT");
-    
+
     const char *baseline_test = getenv("CXLMEMSIM_BASELINE_TEST");
     const char *device_mem_size = getenv("CXL_MEMSIM_DEVICE_MEM_SIZE");
     if (baseline_test && baseline_test[0]) {
@@ -1778,16 +1660,32 @@ static void cxl_memsim_init(void) {
 
     qemu_log("%s: CXLMemSim Memory Size: %d MB", __func__, DEVICE_MEM_SIZE);
 
-    switch(DEVICE_MEM_SIZE) {
-        case 256: g_memsim.dpa_base = 0x600000ULL; break;
-        // Dummy Values Fill Out
-        case 512: g_memsim.dpa_base = 0xA00000ULL; break;
-        case 1024: g_memsim.dpa_base = 0x1200000ULL; break;
-        case 2048: g_memsim.dpa_base = 0x2200000ULL; break;
-        case 4096: g_memsim.dpa_base = 0x4200000ULL; break;
-        case 8192: g_memsim.dpa_base = 0x8200000ULL; break;
-        case 16384: g_memsim.dpa_base = 0x10200000ULL; break;
-        default: g_memsim.dpa_base = 0x600000ULL; break;
+    switch (DEVICE_MEM_SIZE) {
+    case 256:
+        g_memsim.dpa_base = 0x600000ULL;
+        break;
+    // Dummy Values Fill Out
+    case 512:
+        g_memsim.dpa_base = 0xA00000ULL;
+        break;
+    case 1024:
+        g_memsim.dpa_base = 0x1200000ULL;
+        break;
+    case 2048:
+        g_memsim.dpa_base = 0x2200000ULL;
+        break;
+    case 4096:
+        g_memsim.dpa_base = 0x4200000ULL;
+        break;
+    case 8192:
+        g_memsim.dpa_base = 0x8200000ULL;
+        break;
+    case 16384:
+        g_memsim.dpa_base = 0x10200000ULL;
+        break;
+    default:
+        g_memsim.dpa_base = 0x600000ULL;
+        break;
     }
 
     if (!host || !host[0]) {
@@ -1822,6 +1720,16 @@ static void cxl_memsim_init(void) {
             g_memsim.enabled = true;
             g_memsim.initialized = true;
             info_report("CXL Type3: CXLMemSim RDMA mode - %s:%d", g_memsim.host, g_memsim.port);
+        } else if (strcmp(transport, "file") == 0) {
+            if (!file_transport_path || !file_transport_path[0]) {
+                error_report("CXL Type3: CXL_MEMSIM_IPC_FILE is required for file transport");
+                pthread_mutex_unlock(&g_memsim.lock);
+                return;
+            }
+            g_memsim.transport_mode = CXL_TRANSPORT_FILE;
+            g_memsim.enabled = true;
+            g_memsim.initialized = true;
+            info_report("CXL Type3: CXLMemSim file transport - %s", file_transport_path);
         } else if (strcmp(transport, "shm") == 0) {
             g_memsim.transport_mode = CXL_TRANSPORT_SHM;
             g_memsim.enabled = false;
@@ -1849,7 +1757,7 @@ static void cxl_memsim_init(void) {
 /* Connect function - assumes lock is already held */
 static int cxl_memsim_connect_locked(void) {
     struct sockaddr_in server_addr = {0};
-    
+
     if (g_memsim.connected) {
         return 0;
     }
@@ -1860,13 +1768,37 @@ static int cxl_memsim_connect_locked(void) {
         return 0;
     }
 
+    if (g_memsim.transport_mode == CXL_TRANSPORT_FILE) {
+        const char *path = getenv("CXL_MEMSIM_IPC_FILE");
+        const char *client_id_env = getenv("CXL_MEMSIM_CLIENT_ID");
+        uint32_t client_id = client_id_env ? strtoul(client_id_env, NULL, 10) : 0;
+        if (!path || client_id >= CXL_FILE_MAX_CLIENTS ||
+            !cxl_file_transport_open(&g_memsim.file_transport, path, false, client_id) ||
+            !cxl_file_transport_ready(&g_memsim.file_transport)) {
+            error_report("CXL Type3: failed to attach to ready file transport");
+            cxl_file_transport_close(&g_memsim.file_transport);
+            return -1;
+        }
+        __atomic_store_n(&g_memsim.file_transport.layout->client_active[client_id], 1, __ATOMIC_RELEASE);
+        g_memsim.connected = true;
+        if (!g_memsim.response_thread_running) {
+            int rc = pthread_create(&g_memsim.response_thread, NULL, cxl_memsim_handle_response_thread, NULL);
+            if (rc != 0) {
+                g_memsim.connected = false;
+                cxl_file_transport_close(&g_memsim.file_transport);
+                return -1;
+            }
+            g_memsim.response_thread_running = true;
+        }
+        return 0;
+    }
+
     /* Try RDMA connection if configured */
     if (g_memsim.transport_mode == CXL_TRANSPORT_RDMA) {
         if (cxl_memsim_rdma_available()) {
             /* Use TCP port 9999 for RDMA-aware connections */
             int connection_port = 9999;
-            info_report("CXL Type3: Attempting RDMA connection to %s:%d", 
-                       g_memsim.host, connection_port);
+            info_report("CXL Type3: Attempting RDMA connection to %s:%d", g_memsim.host, connection_port);
             int ret = cxl_memsim_rdma_connect(g_memsim.host, connection_port);
             if (ret == 0) {
                 g_memsim.connected = true;
@@ -1879,42 +1811,38 @@ static int cxl_memsim_connect_locked(void) {
         }
         g_memsim.transport_mode = CXL_TRANSPORT_TCP;
     }
-    
+
     /* Add debugging to track connection source with backtrace */
     static int connection_count = 0;
     connection_count++;
-    info_report("CXL Type3: Connection attempt #%d to CXLMemSim server at %s:%d",
-                connection_count, g_memsim.host, g_memsim.port);
-    
+    info_report("CXL Type3: Connection attempt #%d to CXLMemSim server at %s:%d", connection_count, g_memsim.host,
+                g_memsim.port);
+
     g_memsim.socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (g_memsim.socket_fd < 0) {
         qemu_log("CXL Type3: Failed to create socket for CXLMemSim connection\n");
         return -1;
     }
-    
+
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(g_memsim.port);
     inet_pton(AF_INET, g_memsim.host, &server_addr.sin_addr);
-    
-    if (connect(g_memsim.socket_fd, (struct sockaddr *)&server_addr, 
-                sizeof(server_addr)) < 0) {
+
+    if (connect(g_memsim.socket_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         close(g_memsim.socket_fd);
         g_memsim.socket_fd = -1;
-        qemu_log("CXL Type3: Failed to connect to CXLMemSim server at %s:%d\n",
-                 g_memsim.host, g_memsim.port);
+        qemu_log("CXL Type3: Failed to connect to CXLMemSim server at %s:%d\n", g_memsim.host, g_memsim.port);
         error_report("CXL Type3: Failed to connect to CXLMemSim");
         return -1;
     }
-    
+
     int flag = 1;
     setsockopt(g_memsim.socket_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-    
+
     g_memsim.connected = true;
-    qemu_log("CXL Type3: Successfully connected to CXLMemSim (fd=%d)\n", 
-             g_memsim.socket_fd);
-    info_report("CXL Type3: Successfully connected to CXLMemSim (fd=%d)", 
-                g_memsim.socket_fd);
-    
+    qemu_log("CXL Type3: Successfully connected to CXLMemSim (fd=%d)\n", g_memsim.socket_fd);
+    info_report("CXL Type3: Successfully connected to CXLMemSim (fd=%d)", g_memsim.socket_fd);
+
     // Start response handler thread after successful connection
     if (!g_memsim.response_thread_running) {
         int memsim_rc = pthread_create(&g_memsim.response_thread, NULL, cxl_memsim_handle_response_thread, NULL);
@@ -1925,15 +1853,13 @@ static int cxl_memsim_connect_locked(void) {
             g_memsim.response_thread_running = true;
             qemu_log("CXL Type3: Response handler thread started\n");
         }
-        qemu_log("CXL Type 3: memsim_rc=%d\n", memsim_rc);  
+        qemu_log("CXL Type 3: memsim_rc=%d\n", memsim_rc);
     }
-
 
     return 0;
 }
 
-
-static void* cxl_memsim_handle_response_thread(void *arg) {
+static void *cxl_memsim_handle_response_thread(void *arg) {
     (void)arg;
     while (1) {
         if (!g_memsim.connected) {
@@ -1941,40 +1867,62 @@ static void* cxl_memsim_handle_response_thread(void *arg) {
             abort();
             break;
         }
-        void* ret = cxl_memsim_handle_response(NULL);
-        if (ret != (void*) 0) {
+        void *ret = cxl_memsim_handle_response(NULL);
+        if (ret != (void *)0) {
             // If response was not processed, do not continue
             break;
         }
     }
-    return (void*) 0;
+    return (void *)0;
 }
 
-static void* cxl_memsim_handle_response(void *arg) {
+static void *cxl_memsim_handle_response(void *arg) {
     CXLMemSimResponse resp = {0};
     int rc;
     struct timespec abs_timeout;
-    #ifdef DEBUG_CXL_MEMSIM
-        qemu_log("%s: waiting for response. expected size: %zu bytes\n", __func__, sizeof(CXLMemSimResponse));
-    #endif
-    
-    
-    ssize_t recv_size = recv(g_memsim.socket_fd, &resp, sizeof(CXLMemSimResponse), MSG_WAITALL);
+#ifdef DEBUG_CXL_MEMSIM
+    qemu_log("%s: waiting for response. expected size: %zu bytes\n", __func__, sizeof(CXLMemSimResponse));
+#endif
+
+    ssize_t recv_size;
+    if (g_memsim.transport_mode == CXL_TRANSPORT_FILE) {
+        cxl_file_response_t file_resp;
+        cxl_file_response_ring_t *ring = &g_memsim.file_transport.layout->responses[g_memsim.file_transport.client_id];
+        while (g_memsim.connected && !cxl_file_response_pop(&g_memsim.file_transport, &file_resp)) {
+            uint32_t observed = __atomic_load_n(&ring->wake_word, __ATOMIC_ACQUIRE);
+            if (!cxl_file_response_pop(&g_memsim.file_transport, &file_resp)) {
+                cxl_file_futex_wait(&ring->wake_word, observed);
+            }
+        }
+        if (!g_memsim.connected)
+            return (void *)-1;
+        resp.op_type = file_resp.op_type;
+        resp.status = (RespStatus)file_resp.status;
+        resp.latency_ns = file_resp.latency_ns;
+        resp.old_value = file_resp.old_value;
+        resp.req_thread_id = file_resp.req_thread_id;
+        resp.addr = file_resp.addr;
+        resp.bisnp_req_type = (BISnpReqType)file_resp.bisnp_req_type;
+        memcpy(resp.data, file_resp.data, sizeof(resp.data));
+        recv_size = sizeof(resp);
+    } else {
+        recv_size = recv(g_memsim.socket_fd, &resp, sizeof(CXLMemSimResponse), MSG_WAITALL);
+    }
     if (recv_size != sizeof(CXLMemSimResponse)) {
         qemu_log("%s: [ERROR] failed to receive full response from CXLMemSim: received %zd bytes, expected %zu bytes\n",
                  __func__, recv_size, sizeof(CXLMemSimResponse));
         g_memsim.connected = false;
         g_memsim.socket_fd = -1;
         close(g_memsim.socket_fd);
-        
+
         g_memsim.response_thread_running = false;
         abort();
     }
-    #ifdef VERBOSE_CXL_MEMSIM
-        qemu_log("%s: received response - addr=0x%lx, op_type=%d, status=%d, bisnp_req_type=%d, req_thread_id=%lu\n",
-                __func__, resp.addr, resp.op_type, resp.status, resp.bisnp_req_type, resp.req_thread_id);
-    #endif
-    
+#ifdef VERBOSE_CXL_MEMSIM
+    qemu_log("%s: received response - addr=0x%lx, op_type=%d, status=%d, bisnp_req_type=%d, req_thread_id=%lu\n",
+             __func__, resp.addr, resp.op_type, resp.status, resp.bisnp_req_type, resp.req_thread_id);
+#endif
+
     // clock_gettime(CLOCK_REALTIME, &abs_timeout);
     // abs_timeout.tv_sec += 5; // Wait for 5 seconds before timing out
     // rc = pthread_mutex_timedlock(&g_memsim.pending_lock, &abs_timeout);
@@ -1992,24 +1940,21 @@ static void* cxl_memsim_handle_response(void *arg) {
         pthread_mutex_unlock(&g_memsim.pending_lock);
         abort();
     }
-    
-    
-    if (resp.op_type == OP_TYPE_BISNP) { // Example response type, should be set based on actual response 
+
+    if (resp.op_type == OP_TYPE_BISNP) { // Example response type, should be set based on actual response
         g_memsim.pending_ready_type = PENDING_READY_TYPE_BISNP;
-        CXLMemSimRequest req = {
-            .op_type = OP_TYPE_BISNP,
-            .addr = resp.addr,
-            .resp_thread_id = resp.req_thread_id,
-            .size = 64, // Assuming cacheline size
-            .timestamp = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
-            .bisnp_resp_type = BISnpRespNone
-        };
+        CXLMemSimRequest req = {.op_type = OP_TYPE_BISNP,
+                                .addr = resp.addr,
+                                .resp_thread_id = resp.req_thread_id,
+                                .size = 64, // Assuming cacheline size
+                                .timestamp = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+                                .bisnp_resp_type = BISnpRespNone};
 
         MemSimCacheState cpu_cache_state;
         bool cpu_cache_hit;
         if (resp.bisnp_req_type == BISnpCurr) {
             // Send the Current State of the Cache-Line
-            cache_read(g_memsim.cache, resp.addr, (uint64_t*)req.data, &cpu_cache_state, &cpu_cache_hit);
+            cache_read(g_memsim.cache, resp.addr, (uint64_t *)req.data, &cpu_cache_state, &cpu_cache_hit);
             if (cpu_cache_hit) {
                 if (cpu_cache_state == MESI_MODIFIED) {
                     req.bisnp_resp_type = BISnpE;
@@ -2023,13 +1968,13 @@ static void* cxl_memsim_handle_response(void *arg) {
             } else {
                 req.bisnp_resp_type = BISnpI;
             }
-            #ifdef VERBOSE_CXL_MEMSIM
+#ifdef VERBOSE_CXL_MEMSIM
             qemu_log("%s: handling BISnpCurr request {addr=0x%lx}, responding with current cache state %d, hit: %d\n",
                      __func__, resp.addr, req.bisnp_resp_type, cpu_cache_hit);
-            #endif
+#endif
         } else if (resp.bisnp_req_type == BISnpData) {
             // Send the Exclusive or Shared State of the Cache-Line
-            cache_read(g_memsim.cache, resp.addr, (uint64_t*)req.data, &cpu_cache_state, &cpu_cache_hit);
+            cache_read(g_memsim.cache, resp.addr, (uint64_t *)req.data, &cpu_cache_state, &cpu_cache_hit);
             if (cpu_cache_hit) {
                 if (cpu_cache_state == MESI_MODIFIED) {
                     req.bisnp_resp_type = BISnpS;
@@ -2045,43 +1990,56 @@ static void* cxl_memsim_handle_response(void *arg) {
             } else {
                 req.bisnp_resp_type = BISnpI;
             }
-            #ifdef VERBOSE_CXL_MEMSIM
+#ifdef VERBOSE_CXL_MEMSIM
             qemu_log("%s: handling BISnpData request {addr=0x%lx}, responding with current cache state %d, hit: %d\n",
                      __func__, resp.addr, req.bisnp_resp_type, cpu_cache_hit);
-            #endif
+#endif
         } else if (resp.bisnp_req_type == BISnpInv) {
             // Send the Exclusive State of the Cache-Line including capacity evictions
-            cache_read(g_memsim.cache, resp.addr, (uint64_t*)req.data, &cpu_cache_state, &cpu_cache_hit);
+            cache_read(g_memsim.cache, resp.addr, (uint64_t *)req.data, &cpu_cache_state, &cpu_cache_hit);
             if (cpu_cache_hit) {
                 change_cache_state(g_memsim.cache, resp.addr, MESI_INVALID);
             }
             req.bisnp_resp_type = BISnpI;
-            #ifdef VERBOSE_CXL_MEMSIM
+#ifdef VERBOSE_CXL_MEMSIM
             qemu_log("%s: handling BISnpInv request {addr=0x%lx}, responding with current cache state %d, hit: %d\n",
                      __func__, resp.addr, req.bisnp_resp_type, cpu_cache_hit);
-            #endif
+#endif
         } else {
-            #ifdef VERBOSE_CXL_MEMSIM
-                qemu_log("%s: BISnpNone %d\n", __func__, resp.bisnp_req_type);
-            #endif
+#ifdef VERBOSE_CXL_MEMSIM
+            qemu_log("%s: BISnpNone %d\n", __func__, resp.bisnp_req_type);
+#endif
             // pthread_mutex_unlock(&g_memsim.pending_lock);
             return 0;
         }
         clock_gettime(CLOCK_REALTIME, &abs_timeout);
         abs_timeout.tv_sec += 5; // Wait for 5 seconds before timing out
-        #ifdef DEBUG_CXL_MEMSIM
-            qemu_log("%s: back-invalidate attempting to aquire sock_lock\n", __func__);
-        #endif
+#ifdef DEBUG_CXL_MEMSIM
+        qemu_log("%s: back-invalidate attempting to aquire sock_lock\n", __func__);
+#endif
         rc = pthread_mutex_timedlock(&g_memsim.sock_lock, &abs_timeout);
-        #ifdef DEBUG_CXL_MEMSIM
-            qemu_log("%s: back-invalidate aquired sock_lock\n", __func__);
-        #endif
+#ifdef DEBUG_CXL_MEMSIM
+        qemu_log("%s: back-invalidate aquired sock_lock\n", __func__);
+#endif
         if (rc == ETIMEDOUT) {
             qemu_log("%s: [ERROR] failed to acquire sock_lock %s\n", __func__, strerror(rc));
             pthread_mutex_unlock(&g_memsim.sock_lock);
             abort();
         }
-        if (send(g_memsim.socket_fd, &req, sizeof(req), MSG_NOSIGNAL) != sizeof(req)) {
+        if (g_memsim.transport_mode == CXL_TRANSPORT_FILE) {
+            cxl_file_request_t file_req = {0};
+            file_req.op_type = req.op_type;
+            file_req.addr = req.addr;
+            file_req.size = req.size;
+            file_req.timestamp = req.timestamp;
+            file_req.resp_thread_id = req.resp_thread_id;
+            file_req.bisnp_resp_type = req.bisnp_resp_type;
+            memcpy(file_req.data, req.data, sizeof(file_req.data));
+            if (!cxl_file_request_push(&g_memsim.file_transport, &file_req)) {
+                pthread_mutex_unlock(&g_memsim.sock_lock);
+                return (void *)-1;
+            }
+        } else if (send(g_memsim.socket_fd, &req, sizeof(req), MSG_NOSIGNAL) != sizeof(req)) {
             qemu_log("%s: [ERROR] failed to send back-invalidate response\n", __func__);
             pthread_mutex_unlock(&g_memsim.sock_lock);
             g_memsim.connected = false;
@@ -2091,9 +2049,9 @@ static void* cxl_memsim_handle_response(void *arg) {
         }
         g_memsim.pending_ready_type = PENDING_READY_TYPE_NONE;
         pthread_mutex_unlock(&g_memsim.sock_lock);
-        #ifdef DEBUG_CXL_MEMSIM
-            qemu_log("%s: back-invalidate released sock_lock\n", __func__);
-        #endif
+#ifdef DEBUG_CXL_MEMSIM
+        qemu_log("%s: back-invalidate released sock_lock\n", __func__);
+#endif
     } else { /* response for the CPU request*/
         clock_gettime(CLOCK_REALTIME, &abs_timeout);
         abs_timeout.tv_sec += 5; // Wait for 5 seconds before timing out
@@ -2102,9 +2060,9 @@ static void* cxl_memsim_handle_response(void *arg) {
             qemu_log("%s: Failed to acquire pending_lock for signaling response: %s\n", __func__, strerror(rc));
             abort();
         }
-        #ifdef DEBUG_CXL_MEMSIM
-            qemu_log("%s: signaling pending_cv for CPU request response\n", __func__);
-        #endif
+#ifdef DEBUG_CXL_MEMSIM
+        qemu_log("%s: signaling pending_cv for CPU request response\n", __func__);
+#endif
         g_memsim.pending_ready_type = PENDING_READY_TYPE_CPU_REQ;
         pthread_cond_signal(&g_memsim.pending_cv);
         pthread_mutex_unlock(&g_memsim.pending_lock);
@@ -2130,48 +2088,45 @@ static bool cxl_memsim_has_response(CXLMemSimRequest req) {
     return false;
 }
 
-static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
-                              void *data, CXLMemSnpType snp_type, MemSimCacheState metavalue, CXLMemSimResponse *resp) {
+static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size, void *data, CXLMemSnpType snp_type,
+                              MemSimCacheState metavalue, CXLMemSimResponse *resp) {
     static int request_count = 0;
     request_count++;
     int rc;
     struct timespec abs_timeout;
-    
-    CXLMemSimRequest req = {
-        .op_type = op,
-        .addr = addr,
-        .size = size,
-        .timestamp = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
-        .snp_type = snp_type,
-        .metavalue = metavalue
-    };
 
+    CXLMemSimRequest req = {.op_type = op,
+                            .addr = addr,
+                            .size = size,
+                            .timestamp = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+                            .snp_type = snp_type,
+                            .metavalue = metavalue};
 
     clock_gettime(CLOCK_REALTIME, &abs_timeout);
     abs_timeout.tv_sec += 5; // Wait for 5 seconds before timing out
-    #ifdef DEBUG_CXL_MEMSIM
-        qemu_log("%s: attempting to aquire g_memsim.lock\n", __func__);
-    #endif
+#ifdef DEBUG_CXL_MEMSIM
+    qemu_log("%s: attempting to aquire g_memsim.lock\n", __func__);
+#endif
     rc = pthread_mutex_timedlock(&g_memsim.lock, &abs_timeout);
-    #ifdef DEBUG_CXL_MEMSIM
-        qemu_log("%s: aquired g_memsim.lock\n", __func__);
-    #endif
+#ifdef DEBUG_CXL_MEMSIM
+    qemu_log("%s: aquired g_memsim.lock\n", __func__);
+#endif
     if (rc == ETIMEDOUT) {
         qemu_log("%s: [ERROR] failed to acquire g_memsim.lock %s\n", __func__, strerror(rc));
         abort();
     }
-    
+
     /* Debug logging */
-    if (request_count <= 10) {  /* Only log first 10 requests to avoid spam */
-        info_report("CXL Type3: Request #%d (op=%s, connected=%d, transport=%s)", 
-                    request_count, op == 0 ? "READ" : "WRITE", g_memsim.connected,
+    if (request_count <= 10) { /* Only log first 10 requests to avoid spam */
+        info_report("CXL Type3: Request #%d (op=%s, connected=%d, transport=%s)", request_count,
+                    op == 0 ? "READ" : "WRITE", g_memsim.connected,
                     g_memsim.transport_mode == CXL_TRANSPORT_RDMA ? "RDMA" : "TCP");
     }
-    
+
     /* Use RDMA if in RDMA mode */
     if (g_memsim.transport_mode == CXL_TRANSPORT_RDMA) {
         /* Ensure we're connected */
-        
+
         if (!g_memsim.connected) {
             if (cxl_memsim_connect_locked() < 0) {
                 pthread_mutex_unlock(&g_memsim.lock);
@@ -2179,7 +2134,7 @@ static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
                 abort();
             }
         }
-        
+
         int ret = cxl_memsim_rdma_request(op, addr, size, data, resp);
         if (ret < 0) {
             /* Connection failed, mark as disconnected for retry */
@@ -2195,40 +2150,58 @@ static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
         pthread_mutex_unlock(&g_memsim.lock);
         return ret;
     }
-    
-    /* TCP path */
+
+    /* TCP and file-mapped paths share the existing request serialization. */
     if (!g_memsim.connected && cxl_memsim_connect_locked() < 0) {
         pthread_mutex_unlock(&g_memsim.lock);
         qemu_log("%s: [ERROR] failed to connect to CXLMemSim (TCP mode)\n", __func__);
         abort();
     }
-    
+
     /* Copy data for write operations */
     if (op == OP_TYPE_WRITE && data) {
-        memcpy((void*)req.data, (void*)data, MIN(size, 64));
+        memcpy((void *)req.data, (void *)data, MIN(size, 64));
     }
 
     clock_gettime(CLOCK_REALTIME, &abs_timeout);
     abs_timeout.tv_sec += 5; // Wait for 5 seconds before timing out
-    #ifdef DEBUG_CXL_MEMSIM
-        qemu_log("%s: attempting to aquire sock_lock\n", __func__);
-    #endif
-    rc  = pthread_mutex_timedlock(&g_memsim.sock_lock, &abs_timeout);
-    #ifdef DEBUG_CXL_MEMSIM
-        qemu_log("%s: aquired sock_lock\n", __func__);
-        qemu_log("%s: attempting to aquire pending_lock\n", __func__);
-    #endif
+#ifdef DEBUG_CXL_MEMSIM
+    qemu_log("%s: attempting to aquire sock_lock\n", __func__);
+#endif
+    rc = pthread_mutex_timedlock(&g_memsim.sock_lock, &abs_timeout);
+#ifdef DEBUG_CXL_MEMSIM
+    qemu_log("%s: aquired sock_lock\n", __func__);
+    qemu_log("%s: attempting to aquire pending_lock\n", __func__);
+#endif
     rc |= pthread_mutex_timedlock(&g_memsim.pending_lock, &abs_timeout);
-    #ifdef DEBUG_CXL_MEMSIM
-        qemu_log("%s: aquired pending_lock\n", __func__);
-    #endif
+#ifdef DEBUG_CXL_MEMSIM
+    qemu_log("%s: aquired pending_lock\n", __func__);
+#endif
 
     if (rc == ETIMEDOUT) {
         qemu_log("%s: [ERROR] failed to acquire sock_lock %s\n", __func__, strerror(rc));
         pthread_mutex_unlock(&g_memsim.lock);
         abort();
     }
-    if (send(g_memsim.socket_fd, &req, sizeof(req), MSG_NOSIGNAL) != sizeof(req)) {
+    bool send_failed = false;
+    if (g_memsim.transport_mode == CXL_TRANSPORT_FILE) {
+        cxl_file_request_t file_req = {0};
+        file_req.op_type = req.op_type;
+        file_req.addr = req.addr;
+        file_req.size = req.size;
+        file_req.timestamp = req.timestamp;
+        file_req.value = req.value;
+        file_req.expected = req.expected;
+        file_req.resp_thread_id = req.resp_thread_id;
+        file_req.snp_type = (uint32_t)req.snp_type;
+        file_req.metavalue = (uint32_t)req.metavalue;
+        file_req.bisnp_resp_type = (uint32_t)req.bisnp_resp_type;
+        memcpy(file_req.data, req.data, sizeof(file_req.data));
+        send_failed = !cxl_file_request_push(&g_memsim.file_transport, &file_req);
+    } else {
+        send_failed = send(g_memsim.socket_fd, &req, sizeof(req), MSG_NOSIGNAL) != sizeof(req);
+    }
+    if (send_failed) {
         qemu_log("%s: [ERROR] failed to send request to CXLMemSim\n", __func__);
         pthread_mutex_unlock(&g_memsim.sock_lock);
         pthread_mutex_unlock(&g_memsim.lock);
@@ -2237,11 +2210,11 @@ static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
         g_memsim.socket_fd = -1;
         return -1;
     }
-    
+
     pthread_mutex_unlock(&g_memsim.sock_lock);
-    #ifdef DEBUG_CXL_MEMSIM
-        qemu_log("%s: released sock_lock\n", __func__);
-    #endif
+#ifdef DEBUG_CXL_MEMSIM
+    qemu_log("%s: released sock_lock\n", __func__);
+#endif
 
     if (!cxl_memsim_has_response(req)) {
         pthread_mutex_unlock(&g_memsim.lock);
@@ -2263,50 +2236,49 @@ static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
     //     qemu_log("%s: waiting on pending_cv\n", __func__);
     // #endif
     pthread_cond_wait(&g_memsim.pending_cv, &g_memsim.pending_lock);
-    #ifdef DEBUG_CXL_MEMSIM
-        qemu_log("%s: signaled on pending_cv\n", __func__);
-    #endif
-    
-    // No need to check for address match here since this type of response is only for CPU requests and we assume one at a time.
+#ifdef DEBUG_CXL_MEMSIM
+    qemu_log("%s: signaled on pending_cv\n", __func__);
+#endif
+
+    // No need to check for address match here since this type of response is only for CPU requests and we assume one at
+    // a time.
 
     *resp = g_memsim.pending_response;
     g_memsim.pending_ready_type = PENDING_READY_TYPE_NONE;
 
     pthread_mutex_unlock(&g_memsim.pending_lock);
-    #ifdef DEBUG_CXL_MEMSIM
-        qemu_log("%s: released pending_lock\n", __func__);
-    #endif
-    
-    if (op == OP_TYPE_READ) g_memsim.stats_reads++;
-    else if (op == OP_TYPE_WRITE) g_memsim.stats_writes++;
-    
+#ifdef DEBUG_CXL_MEMSIM
+    qemu_log("%s: released pending_lock\n", __func__);
+#endif
+
+    if (op == OP_TYPE_READ)
+        g_memsim.stats_reads++;
+    else if (op == OP_TYPE_WRITE)
+        g_memsim.stats_writes++;
+
     pthread_mutex_unlock(&g_memsim.lock);
     return 0;
 }
 
-MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
-                           unsigned size, MemTxAttrs attrs)
-{
+MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data, unsigned size, MemTxAttrs attrs) {
     CXLType3Dev *ct3d = CXL_TYPE3(d);
     uint64_t dpa_offset = 0;
     AddressSpace *as = NULL;
     int res;
     // uint64_t* dummy_data = (uint64_t*)malloc(sizeof(uint64_t*)*g_memsim.cache->line_size/sizeof(uint64_t));
     uint64_t dummy_data[8];
-    
+
     MemTxResult ret;
     uint8_t buf[8];
 
-
     /* Initialize CXLMemSim on first use */
     cxl_memsim_init();
-    
-    /* Log all CXL Type3 reads */
-    //info_report("CXL_TYPE3_READ: host_addr=0x%lx size=%u", 
-    //           (unsigned long)host_addr, size);
 
-    res = cxl_type3_hpa_to_as_and_dpa(ct3d, host_addr, size,
-                                      &as, &dpa_offset);
+    /* Log all CXL Type3 reads */
+    // info_report("CXL_TYPE3_READ: host_addr=0x%lx size=%u",
+    //            (unsigned long)host_addr, size);
+
+    res = cxl_type3_hpa_to_as_and_dpa(ct3d, host_addr, size, &as, &dpa_offset);
     if (res) {
         return MEMTX_ERROR;
     }
@@ -2316,89 +2288,88 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
         return MEMTX_OK;
     }
 
-
     if (BASELINE_TEST || g_memsim.quick_boot || dpa_offset < g_memsim.dpa_base) {
         ret = address_space_read(as, dpa_offset, attrs, data, size);
-        #ifdef DEBUG_CXL_MEMSIM
-        qemu_log("%s: dpa=0x%lx size=%u data=0x%lx\n",
-                __func__, (unsigned long)dpa_offset, size, (unsigned long)data[0]);
-        #endif
+#ifdef DEBUG_CXL_MEMSIM
+        qemu_log("%s: dpa=0x%lx size=%u data=0x%lx\n", __func__, (unsigned long)dpa_offset, size,
+                 (unsigned long)data[0]);
+#endif
         return ret;
     } else {
         if (dpa_offset >= g_memsim.dpa_base && dpa_offset < g_memsim.dpa_base + 0x1000) {
-            switch(dpa_offset - g_memsim.dpa_base) {
-                case 0x0: 
-                    memcpy((void*)data, (void*)&g_memsim.latency_ns, size);
-                    break;
-                case 0x8:
-                    memcpy((void*)data, (void*)&g_memsim.quick_boot, size);
-                    break;
-                case 0x10:
-                    memcpy((void*)data, (void*)&g_memsim.stat_last_access_addr, size);
-                    break;
-                case 0x18:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[0].latency_ns, size);
-                    break;
-                case 0x28:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[1].latency_ns, size);
-                    break;
-                case 0x38:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[2].latency_ns, size);
-                    break;
-                case 0x48:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[3].latency_ns, size);
-                    break;
-                case 0x58:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[4].latency_ns, size);
-                    break;
-                case 0x68:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[5].latency_ns, size);
-                    break;
-                case 0x78:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[6].latency_ns, size);
-                    break;
-                case 0x88:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[7].latency_ns, size);
-                    break;
-                case 0x98:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[8].latency_ns, size);
-                    break;
-                case 0xa8:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[9].latency_ns, size);
-                    break; 
-                case 0xb8:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[10].latency_ns, size);
-                    break;
-                case 0xc8:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[11].latency_ns, size);
-                    break;
-                case 0xd8:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[12].latency_ns, size);
-                    break;
-                case 0xe8:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[13].latency_ns, size);
-                    break;
-                case 0xf8:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[14].latency_ns, size);
-                    break;
-                case 0x108:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[15].latency_ns, size);
-                    break;
-                case 0x118:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[16].latency_ns, size);
-                    break;
-                case 0x128:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[17].latency_ns, size);
-                    break;
-                case 0x138:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[18].latency_ns, size);
-                    break;
-                case 0x148:
-                    memcpy((void*)data, (void*)&g_memsim.latency_entries[19].latency_ns, size);
-                    break;
-                default:
-                    memcpy((void*)data, (void*)&g_memsim.error_code, size);
-                    break;
+            switch (dpa_offset - g_memsim.dpa_base) {
+            case 0x0:
+                memcpy((void *)data, (void *)&g_memsim.latency_ns, size);
+                break;
+            case 0x8:
+                memcpy((void *)data, (void *)&g_memsim.quick_boot, size);
+                break;
+            case 0x10:
+                memcpy((void *)data, (void *)&g_memsim.stat_last_access_addr, size);
+                break;
+            case 0x18:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[0].latency_ns, size);
+                break;
+            case 0x28:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[1].latency_ns, size);
+                break;
+            case 0x38:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[2].latency_ns, size);
+                break;
+            case 0x48:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[3].latency_ns, size);
+                break;
+            case 0x58:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[4].latency_ns, size);
+                break;
+            case 0x68:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[5].latency_ns, size);
+                break;
+            case 0x78:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[6].latency_ns, size);
+                break;
+            case 0x88:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[7].latency_ns, size);
+                break;
+            case 0x98:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[8].latency_ns, size);
+                break;
+            case 0xa8:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[9].latency_ns, size);
+                break;
+            case 0xb8:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[10].latency_ns, size);
+                break;
+            case 0xc8:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[11].latency_ns, size);
+                break;
+            case 0xd8:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[12].latency_ns, size);
+                break;
+            case 0xe8:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[13].latency_ns, size);
+                break;
+            case 0xf8:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[14].latency_ns, size);
+                break;
+            case 0x108:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[15].latency_ns, size);
+                break;
+            case 0x118:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[16].latency_ns, size);
+                break;
+            case 0x128:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[17].latency_ns, size);
+                break;
+            case 0x138:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[18].latency_ns, size);
+                break;
+            case 0x148:
+                memcpy((void *)data, (void *)&g_memsim.latency_entries[19].latency_ns, size);
+                break;
+            default:
+                memcpy((void *)data, (void *)&g_memsim.error_code, size);
+                break;
             }
             return MEMTX_OK;
         }
@@ -2407,92 +2378,92 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     /* Forward to CXLMemSim if enabled */
     if (g_memsim.enabled) {
         CXLMemSimResponse resp = {0};
-        #ifdef VERBOSE_CXL_MEMSIM
-            uint32_t offset_bits = intLog2(g_memsim.cache->line_size);
-            uint32_t index_bits = intLog2(g_memsim.cache->num_sets);
-            uint64_t set_no = (dpa_offset >> offset_bits) % g_memsim.cache->num_sets;
-            uint64_t tag    = (dpa_offset >> (offset_bits + index_bits));
-        #endif
+#ifdef VERBOSE_CXL_MEMSIM
+        uint32_t offset_bits = intLog2(g_memsim.cache->line_size);
+        uint32_t index_bits = intLog2(g_memsim.cache->num_sets);
+        uint64_t set_no = (dpa_offset >> offset_bits) % g_memsim.cache->num_sets;
+        uint64_t tag = (dpa_offset >> (offset_bits + index_bits));
+#endif
         uint64_t cache_line_addr = dpa_offset & (~(g_memsim.cache->line_size - 1));
         uint64_t offset_idx = dpa_offset & (g_memsim.cache->line_size - 1);
         static bool cpu_cache_hit;
         static MemSimCacheState cpu_cache_mesi_state;
-        cache_read(g_memsim.cache, cache_line_addr, (uint64_t*)dummy_data, &cpu_cache_mesi_state, &cpu_cache_hit);
+        cache_read(g_memsim.cache, cache_line_addr, (uint64_t *)dummy_data, &cpu_cache_mesi_state, &cpu_cache_hit);
         g_memsim.latency_ns = L3_CACHE_LATENCY_NS;
         g_memsim.stat_last_access_addr = dpa_offset;
         // if (find_latency_entry_idx(dpa_offset) < 0) {
         //     // qemu_log("%s: [ERROR] latency entry not found for dpa=0x%lx\n", __func__, (unsigned long)dpa_offset);
         //     // abort();
         // } else {
-            g_memsim.latency_entries[find_latency_entry_idx(dpa_offset)].latency_ns = L3_CACHE_LATENCY_NS;
+        g_memsim.latency_entries[find_latency_entry_idx(dpa_offset)].latency_ns = L3_CACHE_LATENCY_NS;
         // }
-        
-        if(cpu_cache_hit && cpu_cache_mesi_state != MESI_INVALID) {
-            #ifdef VERBOSE_CXL_MEMSIM
-            qemu_log("%s: cache hit for dpa=0x%lx size=%u mesi_state=%d cache_set=%lu cache_tag=%lu access_size=%u\n", __func__,
-                (unsigned long)dpa_offset, size, cpu_cache_mesi_state, set_no, tag, size);
-            #endif
-            #ifdef DEBUG_CXL_MEMSIM
-            
+
+        if (cpu_cache_hit && cpu_cache_mesi_state != MESI_INVALID) {
+#ifdef VERBOSE_CXL_MEMSIM
+            qemu_log("%s: cache hit for dpa=0x%lx size=%u mesi_state=%d cache_set=%lu cache_tag=%lu access_size=%u\n",
+                     __func__, (unsigned long)dpa_offset, size, cpu_cache_mesi_state, set_no, tag, size);
+#endif
+#ifdef DEBUG_CXL_MEMSIM
+
             qemu_log("%s: cache hit data: ", __func__);
             for (size_t i = 0; i < (sizeof(dummy_data) / sizeof(dummy_data[0])); ++i) {
                 qemu_log("0x%lx ", (unsigned long)dummy_data[i]);
             }
             qemu_log("\n");
-            #endif
-            memcpy((void*)data, (void*)dummy_data + offset_idx, size);
+#endif
+            memcpy((void *)data, (void *)dummy_data + offset_idx, size);
             ret = address_space_read(as, dpa_offset, attrs, buf, size);
             if (ret != MEMTX_OK) {
-                qemu_log("%s: error: dpa=0x%lx size=%u",
-                         __func__, (unsigned long)dpa_offset, size);
+                qemu_log("%s: error: dpa=0x%lx size=%u", __func__, (unsigned long)dpa_offset, size);
             } else {
                 for (unsigned i = 0; i < size; ++i) {
                     if (((uint8_t *)data)[i] != buf[i]) {
-                    #ifdef DEBUG_CXL_MEMSIM  
-                    qemu_log("%s: read coherency failure: dpa=0x%lx offset=%u expected=0x%02x got=0x%02x\n",
-                        __func__, (unsigned long)dpa_offset, i, buf[i], ((uint8_t *)data)[i]);
-                    #endif
-                    } 
+#ifdef DEBUG_CXL_MEMSIM
+                        qemu_log("%s: read coherency failure: dpa=0x%lx offset=%u expected=0x%02x got=0x%02x\n",
+                                 __func__, (unsigned long)dpa_offset, i, buf[i], ((uint8_t *)data)[i]);
+#endif
+                    }
                 }
             }
             return ret;
         }
 
-        #ifdef DEBUG_CXL_MEMSIM
-        qemu_log("%s: Cache miss - forwarding memory request to CXLMemSim - dpa=0x%lx size=%u\n",
-                __func__, (unsigned long)dpa_offset, size);
-        #endif
+#ifdef DEBUG_CXL_MEMSIM
+        qemu_log("%s: Cache miss - forwarding memory request to CXLMemSim - dpa=0x%lx size=%u\n", __func__,
+                 (unsigned long)dpa_offset, size);
+#endif
 
-        if (cxl_memsim_request(OP_TYPE_READ, cache_line_addr, g_memsim.cache->line_size, NULL, SnpData, MESI_EXCLUSIVE /*doesn't matter*/, &resp) == 0) { //MemRdData Transaction
-            #ifdef VERBOSE_CXL_MEMSIM
-            qemu_log("%s: read request completed: latency=%lu ns\n",
-                    __func__, (unsigned long)resp.latency_ns);
-            #endif
-            g_memsim.latency_ns =  resp.latency_ns + L3_CACHE_LATENCY_NS;
+        if (cxl_memsim_request(OP_TYPE_READ, cache_line_addr, g_memsim.cache->line_size, NULL, SnpData,
+                               MESI_EXCLUSIVE /*doesn't matter*/, &resp) == 0) { // MemRdData Transaction
+#ifdef VERBOSE_CXL_MEMSIM
+            qemu_log("%s: read request completed: latency=%lu ns\n", __func__, (unsigned long)resp.latency_ns);
+#endif
+            g_memsim.latency_ns = resp.latency_ns + L3_CACHE_LATENCY_NS;
             g_memsim.stat_last_access_addr = dpa_offset;
             // if (find_latency_entry_idx(dpa_offset) < 0) {
             //     qemu_log("%s: [ERROR] latency entry not found for dpa=0x%lx\n", __func__, (unsigned long)dpa_offset);
             //     abort();
             // } else {
-             g_memsim.latency_entries[find_latency_entry_idx(dpa_offset)].latency_ns = resp.latency_ns + L3_CACHE_LATENCY_NS;
+            g_memsim.latency_entries[find_latency_entry_idx(dpa_offset)].latency_ns =
+                resp.latency_ns + L3_CACHE_LATENCY_NS;
             // }
             if (resp.status == RESP_STATUS_SUCCESS && size <= 64) {
-                memcpy((void*)data, (void*)resp.data + offset_idx, size); 
-                #ifdef DEBUG_CXL_MEMSIM
+                memcpy((void *)data, (void *)resp.data + offset_idx, size);
+#ifdef DEBUG_CXL_MEMSIM
                 qemu_log("%s: resp.data = ", __func__);
                 for (size_t i = 0; i < sizeof(resp.data); ++i) {
                     qemu_log("%02x ", resp.data[i]);
                 }
                 qemu_log("\n");
-                #endif
-                cache_write(g_memsim.cache, cache_line_addr, (uint64_t*)resp.data, g_memsim.cache->line_size);
-                #ifdef VERBOSE_CXL_MEMSIM
-                qemu_log("%s: Cache written: dpa=0x%lx, cache_set=%lu, cache_tag=%lu, access_size=%u, buffer_size=%lu, data=%lx\n",
-                __func__, (unsigned long)dpa_offset,  set_no, tag, size, sizeof(data), (unsigned long)data[0]);
-                #endif
+#endif
+                cache_write(g_memsim.cache, cache_line_addr, (uint64_t *)resp.data, g_memsim.cache->line_size);
+#ifdef VERBOSE_CXL_MEMSIM
+                qemu_log("%s: Cache written: dpa=0x%lx, cache_set=%lu, cache_tag=%lu, access_size=%u, buffer_size=%lu, "
+                         "data=%lx\n",
+                         __func__, (unsigned long)dpa_offset, set_no, tag, size, sizeof(data), (unsigned long)data[0]);
+#endif
             } else {
-                qemu_log("%s: Read failure: dpa=0x%lx size=%u",
-                         __func__, (unsigned long)dpa_offset, size);
+                qemu_log("%s: Read failure: dpa=0x%lx size=%u", __func__, (unsigned long)dpa_offset, size);
                 return MEMTX_ERROR;
             }
         }
@@ -2500,39 +2471,35 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     // MemTxResult ret = address_space_read(as, dpa_offset, attrs, data, size);
     ret = address_space_read(as, dpa_offset, attrs, buf, size);
     if (ret != MEMTX_OK) {
-        qemu_log("%s: read failed: dpa=0x%lx size=%u",
-                 __func__, (unsigned long)dpa_offset, size);
+        qemu_log("%s: read failed: dpa=0x%lx size=%u", __func__, (unsigned long)dpa_offset, size);
     } else {
         for (unsigned i = 0; i < size; ++i) {
             if (((uint8_t *)data)[i] != buf[i]) {
-            #ifdef DEBUG_CXL_MEMSIM
-            qemu_log("%s: read coherency failure: dpa=0x%lx offset=%u expected=0x%02x got=0x%02x\n",
-                     __func__, (unsigned long)dpa_offset, i, buf[i], ((uint8_t *)data)[i]);
-            #endif
-            } 
+#ifdef DEBUG_CXL_MEMSIM
+                qemu_log("%s: read coherency failure: dpa=0x%lx offset=%u expected=0x%02x got=0x%02x\n", __func__,
+                         (unsigned long)dpa_offset, i, buf[i], ((uint8_t *)data)[i]);
+#endif
+            }
         }
     }
     return ret;
 }
 
-MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
-                            unsigned size, MemTxAttrs attrs) {
+MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data, unsigned size, MemTxAttrs attrs) {
 
     CXLType3Dev *ct3d = CXL_TYPE3(d);
     uint64_t dpa_offset = 0;
     AddressSpace *as = NULL;
     int res;
     // uint64_t* dummy_data = (uint64_t*) malloc(sizeof(uint64_t)*g_memsim.cache->line_size/sizeof(uint64_t));
-    uint64_t dummy_data[CXL_CACHE_LINE_SIZE/sizeof(uint64_t)];
+    uint64_t dummy_data[CXL_CACHE_LINE_SIZE / sizeof(uint64_t)];
     MemTxResult ret;
     /* Initialize CXLMemSim on first use */
     cxl_memsim_init();
-    
-    
+
     /* Log all CXL Type3 writes */
 
-    res = cxl_type3_hpa_to_as_and_dpa(ct3d, host_addr, size,
-                                      &as, &dpa_offset);
+    res = cxl_type3_hpa_to_as_and_dpa(ct3d, host_addr, size, &as, &dpa_offset);
     if (res) {
         return MEMTX_ERROR;
     }
@@ -2541,43 +2508,88 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
         return MEMTX_OK;
     }
     // Configuration Space
-    
+
     if (dpa_offset >= g_memsim.dpa_base && dpa_offset < g_memsim.dpa_base + 0x1000) {
-        switch(dpa_offset - g_memsim.dpa_base) {
-            // case 0x0: memcpy(&g_memsim.latency_ns, (void*)&data, size);  break;// Can't write to latency_ns, it's read-only
-            case 0x8: memcpy(&g_memsim.quick_boot, (void*)&data, size);  break;// Copy from data to quick_boot buffer
-            case 0x20: memcpy(&g_memsim.latency_entries[0].dpa, (void*)&data, size);  break; // Copy from data to latency_entries[0].dpa buffer
-            case 0x30: memcpy(&g_memsim.latency_entries[1].dpa, (void*)&data, size);  break; // Copy from data to latency_entries[0].dpa buffer
-            case 0x40: memcpy(&g_memsim.latency_entries[2].dpa, (void*)&data, size);  break; // Copy from data to latency_entries[1].dpa buffer
-            case 0x50: memcpy(&g_memsim.latency_entries[3].dpa, (void*)&data, size);  break; // Copy from data to latency_entries[1].dpa buffer
-            case 0x60: memcpy(&g_memsim.latency_entries[4].dpa, (void*)&data, size);  break; // Copy from data to latency_entries[2].dpa buffer
-            case 0x70: memcpy(&g_memsim.latency_entries[5].dpa, (void*)&data, size);  break; // Copy from data to latency_entries[2].dpa buffer
-            case 0x80: memcpy(&g_memsim.latency_entries[6].dpa, (void*)&data, size);  break; // Copy from data to latency_entries
-            // Contiue till latency_entries[19].dpa
-            case 0x90: memcpy(&g_memsim.latency_entries[7].dpa, (void*)&data, size);  break; 
-            case 0xA0: memcpy(&g_memsim.latency_entries[8].dpa, (void*)&data, size);  break; 
-            case 0xB0: memcpy(&g_memsim.latency_entries[9].dpa, (void*)&data, size);  break; 
-            case 0xC0: memcpy(&g_memsim.latency_entries[10].dpa, (void*)&data, size);  break; 
-            case 0xD0: memcpy(&g_memsim.latency_entries[11].dpa, (void*)&data, size);  break; 
-            case 0xE0: memcpy(&g_memsim.latency_entries[12].dpa, (void*)&data, size);  break; 
-            case 0xF0: memcpy(&g_memsim.latency_entries[13].dpa, (void*)&data, size);  break; 
-            case 0x100: memcpy(&g_memsim.latency_entries[14].dpa, (void*)&data, size);  break; 
-            case 0x110: memcpy(&g_memsim.latency_entries[15].dpa, (void*)&data, size);  break; 
-            case 0x120: memcpy(&g_memsim.latency_entries[16].dpa, (void*)&data, size);  break; 
-            case 0x130: memcpy(&g_memsim.latency_entries[17].dpa, (void*)&data, size);  break; 
-            case 0x140: memcpy(&g_memsim.latency_entries[18].dpa, (void*)&data, size);  break; 
-            case 0x150: memcpy(&g_memsim.latency_entries[19].dpa, (void*)&data, size);  break;
-            default: g_memsim.error_code = -1;   break; // Copy from data to error buffer
+        switch (dpa_offset - g_memsim.dpa_base) {
+        // case 0x0: memcpy(&g_memsim.latency_ns, (void*)&data, size);  break;// Can't write to latency_ns, it's
+        // read-only
+        case 0x8:
+            memcpy(&g_memsim.quick_boot, (void *)&data, size);
+            break; // Copy from data to quick_boot buffer
+        case 0x20:
+            memcpy(&g_memsim.latency_entries[0].dpa, (void *)&data, size);
+            break; // Copy from data to latency_entries[0].dpa buffer
+        case 0x30:
+            memcpy(&g_memsim.latency_entries[1].dpa, (void *)&data, size);
+            break; // Copy from data to latency_entries[0].dpa buffer
+        case 0x40:
+            memcpy(&g_memsim.latency_entries[2].dpa, (void *)&data, size);
+            break; // Copy from data to latency_entries[1].dpa buffer
+        case 0x50:
+            memcpy(&g_memsim.latency_entries[3].dpa, (void *)&data, size);
+            break; // Copy from data to latency_entries[1].dpa buffer
+        case 0x60:
+            memcpy(&g_memsim.latency_entries[4].dpa, (void *)&data, size);
+            break; // Copy from data to latency_entries[2].dpa buffer
+        case 0x70:
+            memcpy(&g_memsim.latency_entries[5].dpa, (void *)&data, size);
+            break; // Copy from data to latency_entries[2].dpa buffer
+        case 0x80:
+            memcpy(&g_memsim.latency_entries[6].dpa, (void *)&data, size);
+            break; // Copy from data to latency_entries
+        // Contiue till latency_entries[19].dpa
+        case 0x90:
+            memcpy(&g_memsim.latency_entries[7].dpa, (void *)&data, size);
+            break;
+        case 0xA0:
+            memcpy(&g_memsim.latency_entries[8].dpa, (void *)&data, size);
+            break;
+        case 0xB0:
+            memcpy(&g_memsim.latency_entries[9].dpa, (void *)&data, size);
+            break;
+        case 0xC0:
+            memcpy(&g_memsim.latency_entries[10].dpa, (void *)&data, size);
+            break;
+        case 0xD0:
+            memcpy(&g_memsim.latency_entries[11].dpa, (void *)&data, size);
+            break;
+        case 0xE0:
+            memcpy(&g_memsim.latency_entries[12].dpa, (void *)&data, size);
+            break;
+        case 0xF0:
+            memcpy(&g_memsim.latency_entries[13].dpa, (void *)&data, size);
+            break;
+        case 0x100:
+            memcpy(&g_memsim.latency_entries[14].dpa, (void *)&data, size);
+            break;
+        case 0x110:
+            memcpy(&g_memsim.latency_entries[15].dpa, (void *)&data, size);
+            break;
+        case 0x120:
+            memcpy(&g_memsim.latency_entries[16].dpa, (void *)&data, size);
+            break;
+        case 0x130:
+            memcpy(&g_memsim.latency_entries[17].dpa, (void *)&data, size);
+            break;
+        case 0x140:
+            memcpy(&g_memsim.latency_entries[18].dpa, (void *)&data, size);
+            break;
+        case 0x150:
+            memcpy(&g_memsim.latency_entries[19].dpa, (void *)&data, size);
+            break;
+        default:
+            g_memsim.error_code = -1;
+            break; // Copy from data to error buffer
         }
         return MEMTX_OK;
     }
 
     if (BASELINE_TEST || g_memsim.quick_boot || dpa_offset < g_memsim.dpa_base) {
         ret = address_space_write(as, dpa_offset, attrs, &data, size);
-        #ifdef DEBUG_CXL_MEMSIM
-        qemu_log("%s: baseline dpa=0x%lx size=%u data=0x%lx\n",
-                __func__, (unsigned long)dpa_offset, size, (unsigned long)data);
-        #endif
+#ifdef DEBUG_CXL_MEMSIM
+        qemu_log("%s: baseline dpa=0x%lx size=%u data=0x%lx\n", __func__, (unsigned long)dpa_offset, size,
+                 (unsigned long)data);
+#endif
         return ret;
     }
 
@@ -2585,72 +2597,74 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     if (g_memsim.enabled) {
         CXLMemSimResponse resp = {0};
 
-        #ifdef VERBOSE_CXL_MEMSIM
+#ifdef VERBOSE_CXL_MEMSIM
         uint32_t offset_bits = intLog2(g_memsim.cache->line_size);
         uint32_t index_bits = intLog2(g_memsim.cache->num_sets);
-        #endif
+#endif
         uint64_t cache_line_addr = dpa_offset & (~(g_memsim.cache->line_size - 1));
         // uint64_t offset_idx = dpa_offset & (g_memsim.cache->line_size - 1);
-        
-        #ifdef VERBOSE_CXL_MEMSIM
+
+#ifdef VERBOSE_CXL_MEMSIM
         uint64_t set_no = (dpa_offset >> offset_bits) % g_memsim.cache->num_sets;
-        uint64_t tag    = (dpa_offset >> (offset_bits + index_bits));
-        #endif
+        uint64_t tag = (dpa_offset >> (offset_bits + index_bits));
+#endif
 
         bool cpu_cache_hit;
         MemSimCacheState cpu_cache_mesi_state;
-        cache_read(g_memsim.cache, dpa_offset, (uint64_t*)dummy_data, &cpu_cache_mesi_state, &cpu_cache_hit);
+        cache_read(g_memsim.cache, dpa_offset, (uint64_t *)dummy_data, &cpu_cache_mesi_state, &cpu_cache_hit);
         if (cpu_cache_hit && (cpu_cache_mesi_state == MESI_MODIFIED || cpu_cache_mesi_state == MESI_EXCLUSIVE)) {
-            cache_write(g_memsim.cache, dpa_offset, (uint64_t*)&data, size);
-            #ifdef VERBOSE_CXL_MEMSIM
-            qemu_log("%s: cache hit - written in cache dpa=0x%lx, cache_set=%lu, cache_tag=%lu, access_size=%u, buffer_size=%lu, data=%lx\n", 
-                __func__, (unsigned long)dpa_offset,  set_no, tag, size, sizeof(data), (unsigned long)data);
-            #endif
-            ret = address_space_write(as, dpa_offset, attrs, &data, size); /* not in real system - but only for protocol correctness checking */
+            cache_write(g_memsim.cache, dpa_offset, (uint64_t *)&data, size);
+#ifdef VERBOSE_CXL_MEMSIM
+            qemu_log("%s: cache hit - written in cache dpa=0x%lx, cache_set=%lu, cache_tag=%lu, access_size=%u, "
+                     "buffer_size=%lu, data=%lx\n",
+                     __func__, (unsigned long)dpa_offset, set_no, tag, size, sizeof(data), (unsigned long)data);
+#endif
+            ret = address_space_write(as, dpa_offset, attrs, &data,
+                                      size); /* not in real system - but only for protocol correctness checking */
             return ret;
         }
-        #ifdef VERBOSE_CXL_MEMSIM
-        qemu_log("%s: cache miss - forwarding to CXLMemSim - dpa=0x%lx size=%u\n",
-                __func__, (unsigned long)dpa_offset, size);
-        #endif
-        
-        if (cxl_memsim_request(OP_TYPE_READ, cache_line_addr, g_memsim.cache->line_size, NULL, SnpInv, MESI_EXCLUSIVE /*doesn't matter*/, &resp) == 0) { //MemRd with SnpInv (Host wants a Exclusive Copy of the Cache-Line)
+#ifdef VERBOSE_CXL_MEMSIM
+        qemu_log("%s: cache miss - forwarding to CXLMemSim - dpa=0x%lx size=%u\n", __func__, (unsigned long)dpa_offset,
+                 size);
+#endif
+
+        if (cxl_memsim_request(OP_TYPE_READ, cache_line_addr, g_memsim.cache->line_size, NULL, SnpInv,
+                               MESI_EXCLUSIVE /*doesn't matter*/,
+                               &resp) == 0) { // MemRd with SnpInv (Host wants a Exclusive Copy of the Cache-Line)
             if (resp.status == RESP_STATUS_SUCCESS) {
-                #ifdef VERBOSE_CXL_MEMSIM
+#ifdef VERBOSE_CXL_MEMSIM
                 qemu_log("%s: response received - resp.data = ", __func__);
-                for (size_t i = 0; i < sizeof(resp.data); ++i)
-                {
+                for (size_t i = 0; i < sizeof(resp.data); ++i) {
                     qemu_log("%02x ", resp.data[i]);
                 }
                 qemu_log("\n");
-                #endif 
-                cache_write(g_memsim.cache, cache_line_addr, (uint64_t*)resp.data, g_memsim.cache->line_size);
-                cache_write(g_memsim.cache, dpa_offset, (uint64_t*)&data, size);
-                #ifdef VERBOSE_CXL_MEMSIM
-                qemu_log("%s: write in cache: dpa=0x%lx, cache_set=%lu, cache_tag=%lu, access_size=%u, buffer_size=%lu, data=%lx\n", 
-                __func__, (unsigned long)dpa_offset,  set_no, tag, size, sizeof(data), (unsigned long)data);
-                #endif
+#endif
+                cache_write(g_memsim.cache, cache_line_addr, (uint64_t *)resp.data, g_memsim.cache->line_size);
+                cache_write(g_memsim.cache, dpa_offset, (uint64_t *)&data, size);
+#ifdef VERBOSE_CXL_MEMSIM
+                qemu_log("%s: write in cache: dpa=0x%lx, cache_set=%lu, cache_tag=%lu, access_size=%u, "
+                         "buffer_size=%lu, data=%lx\n",
+                         __func__, (unsigned long)dpa_offset, set_no, tag, size, sizeof(data), (unsigned long)data);
+#endif
             } else {
-                qemu_log("%s: request failed in MemRdSnpInv: dpa=0x%lx size=%u",
-                         __func__, (unsigned long)dpa_offset, size);
+                qemu_log("%s: request failed in MemRdSnpInv: dpa=0x%lx size=%u", __func__, (unsigned long)dpa_offset,
+                         size);
                 return MEMTX_ERROR;
             }
         }
     }
- 
+
     ret = address_space_write(as, dpa_offset, attrs, &data, size);
-    
+
     /* Log successful writes */
     if (ret != MEMTX_OK) {
-        qemu_log("%s: CXL_TYPE3_WRITE_FAILED: dpa=0x%lx size=%u",
-                 __func__, (unsigned long)dpa_offset, size);
+        qemu_log("%s: CXL_TYPE3_WRITE_FAILED: dpa=0x%lx size=%u", __func__, (unsigned long)dpa_offset, size);
     }
-    
+
     return ret;
 }
 
-static void ct3d_reset(DeviceState *dev)
-{
+static void ct3d_reset(DeviceState *dev) {
     CXLType3Dev *ct3d = CXL_TYPE3(dev);
     uint32_t *reg_state = ct3d->cxl_cstate.crb.cache_mem_registers;
     uint32_t *write_msk = ct3d->cxl_cstate.crb.cache_mem_regs_write_mask;
@@ -2666,38 +2680,29 @@ static void ct3d_reset(DeviceState *dev)
     if (ct3d->vdm_fm_owned_ld_mctp_cci.initialized) {
         cxl_destroy_cci(&ct3d->vdm_fm_owned_ld_mctp_cci);
     }
-    cxl_initialize_t3_fm_owned_ld_mctpcci(&ct3d->vdm_fm_owned_ld_mctp_cci,
-                                          DEVICE(ct3d), DEVICE(ct3d),
+    cxl_initialize_t3_fm_owned_ld_mctpcci(&ct3d->vdm_fm_owned_ld_mctp_cci, DEVICE(ct3d), DEVICE(ct3d),
                                           512); /* Max payload made up */
     if (ct3d->ld0_cci.initialized) {
         cxl_destroy_cci(&ct3d->ld0_cci);
     }
-    cxl_initialize_t3_ld_cci(&ct3d->ld0_cci, DEVICE(ct3d), DEVICE(ct3d),
-                             512); /* Max payload made up */
+    cxl_initialize_t3_ld_cci(&ct3d->ld0_cci, DEVICE(ct3d), DEVICE(ct3d), 512); /* Max payload made up */
 }
 
 static const Property ct3_props[] = {
     DEFINE_PROP_LINK("memdev", CXLType3Dev, hostmem, TYPE_MEMORY_BACKEND,
                      HostMemoryBackend *), /* for backward compatibility */
-    DEFINE_PROP_LINK("persistent-memdev", CXLType3Dev, hostpmem,
-                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
-    DEFINE_PROP_LINK("volatile-memdev", CXLType3Dev, hostvmem,
-                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
-    DEFINE_PROP_LINK("lsa", CXLType3Dev, lsa, TYPE_MEMORY_BACKEND,
-                     HostMemoryBackend *),
+    DEFINE_PROP_LINK("persistent-memdev", CXLType3Dev, hostpmem, TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_LINK("volatile-memdev", CXLType3Dev, hostvmem, TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_LINK("lsa", CXLType3Dev, lsa, TYPE_MEMORY_BACKEND, HostMemoryBackend *),
     DEFINE_PROP_UINT64("sn", CXLType3Dev, sn, UI64_NULL),
     DEFINE_PROP_STRING("cdat", CXLType3Dev, cxl_cstate.cdat.filename),
     DEFINE_PROP_UINT8("num-dc-regions", CXLType3Dev, dc.num_regions, 0),
-    DEFINE_PROP_LINK("volatile-dc-memdev", CXLType3Dev, dc.host_dc,
-                     TYPE_MEMORY_BACKEND, HostMemoryBackend *),
-    DEFINE_PROP_PCIE_LINK_SPEED("x-speed", CXLType3Dev,
-                                speed, PCIE_LINK_SPEED_32),
-    DEFINE_PROP_PCIE_LINK_WIDTH("x-width", CXLType3Dev,
-                                width, PCIE_LINK_WIDTH_16),
+    DEFINE_PROP_LINK("volatile-dc-memdev", CXLType3Dev, dc.host_dc, TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_PCIE_LINK_SPEED("x-speed", CXLType3Dev, speed, PCIE_LINK_SPEED_32),
+    DEFINE_PROP_PCIE_LINK_WIDTH("x-width", CXLType3Dev, width, PCIE_LINK_WIDTH_16),
 };
 
-static uint64_t get_lsa_size(CXLType3Dev *ct3d)
-{
+static uint64_t get_lsa_size(CXLType3Dev *ct3d) {
     MemoryRegion *mr;
 
     if (!ct3d->lsa) {
@@ -2708,16 +2713,12 @@ static uint64_t get_lsa_size(CXLType3Dev *ct3d)
     return memory_region_size(mr);
 }
 
-static void validate_lsa_access(MemoryRegion *mr, uint64_t size,
-                                uint64_t offset)
-{
+static void validate_lsa_access(MemoryRegion *mr, uint64_t size, uint64_t offset) {
     assert(offset + size <= memory_region_size(mr));
     assert(offset + size > offset);
 }
 
-static uint64_t get_lsa(CXLType3Dev *ct3d, void *buf, uint64_t size,
-                    uint64_t offset)
-{
+static uint64_t get_lsa(CXLType3Dev *ct3d, void *buf, uint64_t size, uint64_t offset) {
     MemoryRegion *mr;
     void *lsa;
 
@@ -2734,9 +2735,7 @@ static uint64_t get_lsa(CXLType3Dev *ct3d, void *buf, uint64_t size,
     return size;
 }
 
-static void set_lsa(CXLType3Dev *ct3d, const void *buf, uint64_t size,
-                    uint64_t offset)
-{
+static void set_lsa(CXLType3Dev *ct3d, const void *buf, uint64_t size, uint64_t offset) {
     MemoryRegion *mr;
     void *lsa;
 
@@ -2757,8 +2756,7 @@ static void set_lsa(CXLType3Dev *ct3d, const void *buf, uint64_t size,
      */
 }
 
-static bool set_cacheline(CXLType3Dev *ct3d, uint64_t dpa_offset, uint8_t *data)
-{
+static bool set_cacheline(CXLType3Dev *ct3d, uint64_t dpa_offset, uint8_t *data) {
     MemoryRegion *vmr = NULL, *pmr = NULL, *dc_mr = NULL;
     AddressSpace *as;
     uint64_t vmr_size = 0, pmr_size = 0, dc_size = 0;
@@ -2774,7 +2772,7 @@ static bool set_cacheline(CXLType3Dev *ct3d, uint64_t dpa_offset, uint8_t *data)
     if (ct3d->dc.host_dc) {
         dc_mr = host_memory_backend_get_memory(ct3d->dc.host_dc);
         dc_size = memory_region_size(dc_mr);
-     }
+    }
 
     if (!vmr && !pmr && !dc_mr) {
         return false;
@@ -2794,27 +2792,21 @@ static bool set_cacheline(CXLType3Dev *ct3d, uint64_t dpa_offset, uint8_t *data)
         dpa_offset -= (vmr_size + pmr_size);
     }
 
-    address_space_write(as, dpa_offset, MEMTXATTRS_UNSPECIFIED, data,
-                        CXL_CACHE_LINE_SIZE);
+    address_space_write(as, dpa_offset, MEMTXATTRS_UNSPECIFIED, data, CXL_CACHE_LINE_SIZE);
     return true;
 }
 
-void cxl_set_poison_list_overflowed(CXLType3Dev *ct3d)
-{
-        ct3d->poison_list_overflowed = true;
-        ct3d->poison_list_overflow_ts =
-            cxl_device_get_timestamp(&ct3d->cxl_dstate);
+void cxl_set_poison_list_overflowed(CXLType3Dev *ct3d) {
+    ct3d->poison_list_overflowed = true;
+    ct3d->poison_list_overflow_ts = cxl_device_get_timestamp(&ct3d->cxl_dstate);
 }
 
-void cxl_clear_poison_list_overflowed(CXLType3Dev *ct3d)
-{
+void cxl_clear_poison_list_overflowed(CXLType3Dev *ct3d) {
     ct3d->poison_list_overflowed = false;
     ct3d->poison_list_overflow_ts = 0;
 }
 
-void qmp_cxl_inject_poison(const char *path, uint64_t start, uint64_t length,
-                           Error **errp)
-{
+void qmp_cxl_inject_poison(const char *path, uint64_t start, uint64_t length, Error **errp) {
     Object *obj = object_resolve_path(path, NULL);
     CXLType3Dev *ct3d;
     CXLPoison *p;
@@ -2840,8 +2832,7 @@ void qmp_cxl_inject_poison(const char *path, uint64_t start, uint64_t length,
 
     QLIST_FOREACH(p, &ct3d->poison_list, node) {
         if ((start < p->start + p->length) && (start + length > p->start)) {
-            error_setg(errp,
-                       "Overlap with existing poisoned region not supported");
+            error_setg(errp, "Overlap with existing poisoned region not supported");
             return;
         }
     }
@@ -2864,10 +2855,7 @@ void qmp_cxl_inject_poison(const char *path, uint64_t start, uint64_t length,
 }
 
 /* For uncorrectable errors include support for multiple header recording */
-void qmp_cxl_inject_uncorrectable_errors(const char *path,
-                                         CXLUncorErrorRecordList *errors,
-                                         Error **errp)
-{
+void qmp_cxl_inject_uncorrectable_errors(const char *path, CXLUncorErrorRecordList *errors, Error **errp) {
     Object *obj = object_resolve_path(path, NULL);
     static PCIEAERErr err = {};
     CXLType3Dev *ct3d;
@@ -2906,8 +2894,7 @@ void qmp_cxl_inject_uncorrectable_errors(const char *path,
         }
 
         /* If the error is masked, nothing to do here */
-        if (!((1 << cxl_err_code) &
-              ~ldl_le_p(reg_state + R_CXL_RAS_UNC_ERR_MASK))) {
+        if (!((1 << cxl_err_code) & ~ldl_le_p(reg_state + R_CXL_RAS_UNC_ERR_MASK))) {
             errors = errors->next;
             continue;
         }
@@ -2939,15 +2926,12 @@ void qmp_cxl_inject_uncorrectable_errors(const char *path,
             stl_le_p(header_log + i, cxl_err->header[i]);
         }
 
-        capctrl = FIELD_DP32(capctrl, CXL_RAS_ERR_CAP_CTRL,
-                             FIRST_ERROR_POINTER, cxl_err->type);
+        capctrl = FIELD_DP32(capctrl, CXL_RAS_ERR_CAP_CTRL, FIRST_ERROR_POINTER, cxl_err->type);
         stl_le_p(cache_mem + R_CXL_RAS_ERR_CAP_CTRL, capctrl);
     }
 
     unc_err = 0;
-    QTAILQ_FOREACH(cxl_err, &ct3d->error_list, node) {
-        unc_err |= (1 << cxl_err->type);
-    }
+    QTAILQ_FOREACH(cxl_err, &ct3d->error_list, node) { unc_err |= (1 << cxl_err->type); }
     if (!unc_err) {
         return;
     }
@@ -2956,9 +2940,7 @@ void qmp_cxl_inject_uncorrectable_errors(const char *path,
     pcie_aer_inject_error(PCI_DEVICE(obj), &err);
 }
 
-void qmp_cxl_inject_correctable_error(const char *path, CxlCorErrorType type,
-                                      Error **errp)
-{
+void qmp_cxl_inject_correctable_error(const char *path, CxlCorErrorType type, Error **errp) {
     static PCIEAERErr err = {};
     Object *obj = object_resolve_path(path, NULL);
     CXLType3Dev *ct3d;
@@ -2989,8 +2971,7 @@ void qmp_cxl_inject_correctable_error(const char *path, CxlCorErrorType type,
         return;
     }
     /* If the error is masked, nothting to do here */
-    if (!((1 << cxl_err_type) &
-          ~ldl_le_p(reg_state + R_CXL_RAS_COR_ERR_MASK))) {
+    if (!((1 << cxl_err_type) & ~ldl_le_p(reg_state + R_CXL_RAS_COR_ERR_MASK))) {
         return;
     }
 
@@ -3000,10 +2981,8 @@ void qmp_cxl_inject_correctable_error(const char *path, CxlCorErrorType type,
     pcie_aer_inject_error(PCI_DEVICE(obj), &err);
 }
 
-void cxl_assign_event_header(CXLEventRecordHdr *hdr,
-                             const QemuUUID *uuid, uint32_t flags,
-                             uint8_t length, uint64_t timestamp)
-{
+void cxl_assign_event_header(CXLEventRecordHdr *hdr, const QemuUUID *uuid, uint32_t flags, uint8_t length,
+                             uint64_t timestamp) {
     st24_le_p(&hdr->flags, flags);
     hdr->length = length;
     memcpy(&hdr->id, uuid, sizeof(hdr->id));
@@ -3011,27 +2990,23 @@ void cxl_assign_event_header(CXLEventRecordHdr *hdr,
 }
 
 static const QemuUUID gen_media_uuid = {
-    .data = UUID(0xfbcd0a77, 0xc260, 0x417f,
-                 0x85, 0xa9, 0x08, 0x8b, 0x16, 0x21, 0xeb, 0xa6),
+    .data = UUID(0xfbcd0a77, 0xc260, 0x417f, 0x85, 0xa9, 0x08, 0x8b, 0x16, 0x21, 0xeb, 0xa6),
 };
 
 static const QemuUUID dram_uuid = {
-    .data = UUID(0x601dcbb3, 0x9c06, 0x4eab, 0xb8, 0xaf,
-                 0x4e, 0x9b, 0xfb, 0x5c, 0x96, 0x24),
+    .data = UUID(0x601dcbb3, 0x9c06, 0x4eab, 0xb8, 0xaf, 0x4e, 0x9b, 0xfb, 0x5c, 0x96, 0x24),
 };
 
 static const QemuUUID memory_module_uuid = {
-    .data = UUID(0xfe927475, 0xdd59, 0x4339, 0xa5, 0x86,
-                 0x79, 0xba, 0xb1, 0x13, 0xb7, 0x74),
+    .data = UUID(0xfe927475, 0xdd59, 0x4339, 0xa5, 0x86, 0x79, 0xba, 0xb1, 0x13, 0xb7, 0x74),
 };
 
-#define CXL_GMER_VALID_CHANNEL                          BIT(0)
-#define CXL_GMER_VALID_RANK                             BIT(1)
-#define CXL_GMER_VALID_DEVICE                           BIT(2)
-#define CXL_GMER_VALID_COMPONENT                        BIT(3)
+#define CXL_GMER_VALID_CHANNEL BIT(0)
+#define CXL_GMER_VALID_RANK BIT(1)
+#define CXL_GMER_VALID_DEVICE BIT(2)
+#define CXL_GMER_VALID_COMPONENT BIT(3)
 
-static int ct3d_qmp_cxl_event_log_enc(CxlEventLog log)
-{
+static int ct3d_qmp_cxl_event_log_enc(CxlEventLog log) {
     switch (log) {
     case CXL_EVENT_LOG_INFORMATIONAL:
         return CXL_EVENT_TYPE_INFO;
@@ -3046,16 +3021,10 @@ static int ct3d_qmp_cxl_event_log_enc(CxlEventLog log)
     }
 }
 /* Component ID is device specific.  Define this as a string. */
-void qmp_cxl_inject_general_media_event(const char *path, CxlEventLog log,
-                                        uint8_t flags, uint64_t dpa,
-                                        uint8_t descriptor, uint8_t type,
-                                        uint8_t transaction_type,
-                                        bool has_channel, uint8_t channel,
-                                        bool has_rank, uint8_t rank,
-                                        bool has_device, uint32_t device,
-                                        const char *component_id,
-                                        Error **errp)
-{
+void qmp_cxl_inject_general_media_event(const char *path, CxlEventLog log, uint8_t flags, uint64_t dpa,
+                                        uint8_t descriptor, uint8_t type, uint8_t transaction_type, bool has_channel,
+                                        uint8_t channel, bool has_rank, uint8_t rank, bool has_device, uint32_t device,
+                                        const char *component_id, Error **errp) {
     Object *obj = object_resolve_path(path, NULL);
     CXLEventGenMedia gem;
     CXLEventRecordHdr *hdr = &gem.hdr;
@@ -3084,8 +3053,7 @@ void qmp_cxl_inject_general_media_event(const char *path, CxlEventLog log,
     enc_log = rc;
 
     memset(&gem, 0, sizeof(gem));
-    cxl_assign_event_header(hdr, &gen_media_uuid, flags, sizeof(gem),
-                            cxl_device_get_timestamp(&ct3d->cxl_dstate));
+    cxl_assign_event_header(hdr, &gen_media_uuid, flags, sizeof(gem), cxl_device_get_timestamp(&ct3d->cxl_dstate));
 
     stq_le_p(&gem.phys_addr, dpa);
     gem.descriptor = descriptor;
@@ -3108,8 +3076,7 @@ void qmp_cxl_inject_general_media_event(const char *path, CxlEventLog log,
     }
 
     if (component_id) {
-        strncpy((char *)gem.component_id, component_id,
-                sizeof(gem.component_id) - 1);
+        strncpy((char *)gem.component_id, component_id, sizeof(gem.component_id) - 1);
         valid_flags |= CXL_GMER_VALID_COMPONENT;
     }
 
@@ -3120,29 +3087,21 @@ void qmp_cxl_inject_general_media_event(const char *path, CxlEventLog log,
     }
 }
 
-#define CXL_DRAM_VALID_CHANNEL                          BIT(0)
-#define CXL_DRAM_VALID_RANK                             BIT(1)
-#define CXL_DRAM_VALID_NIBBLE_MASK                      BIT(2)
-#define CXL_DRAM_VALID_BANK_GROUP                       BIT(3)
-#define CXL_DRAM_VALID_BANK                             BIT(4)
-#define CXL_DRAM_VALID_ROW                              BIT(5)
-#define CXL_DRAM_VALID_COLUMN                           BIT(6)
-#define CXL_DRAM_VALID_CORRECTION_MASK                  BIT(7)
+#define CXL_DRAM_VALID_CHANNEL BIT(0)
+#define CXL_DRAM_VALID_RANK BIT(1)
+#define CXL_DRAM_VALID_NIBBLE_MASK BIT(2)
+#define CXL_DRAM_VALID_BANK_GROUP BIT(3)
+#define CXL_DRAM_VALID_BANK BIT(4)
+#define CXL_DRAM_VALID_ROW BIT(5)
+#define CXL_DRAM_VALID_COLUMN BIT(6)
+#define CXL_DRAM_VALID_CORRECTION_MASK BIT(7)
 
-void qmp_cxl_inject_dram_event(const char *path, CxlEventLog log, uint8_t flags,
-                               uint64_t dpa, uint8_t descriptor,
-                               uint8_t type, uint8_t transaction_type,
-                               bool has_channel, uint8_t channel,
-                               bool has_rank, uint8_t rank,
-                               bool has_nibble_mask, uint32_t nibble_mask,
-                               bool has_bank_group, uint8_t bank_group,
-                               bool has_bank, uint8_t bank,
-                               bool has_row, uint32_t row,
-                               bool has_column, uint16_t column,
-                               bool has_correction_mask,
-                               uint64List *correction_mask,
-                               Error **errp)
-{
+void qmp_cxl_inject_dram_event(const char *path, CxlEventLog log, uint8_t flags, uint64_t dpa, uint8_t descriptor,
+                               uint8_t type, uint8_t transaction_type, bool has_channel, uint8_t channel, bool has_rank,
+                               uint8_t rank, bool has_nibble_mask, uint32_t nibble_mask, bool has_bank_group,
+                               uint8_t bank_group, bool has_bank, uint8_t bank, bool has_row, uint32_t row,
+                               bool has_column, uint16_t column, bool has_correction_mask, uint64List *correction_mask,
+                               Error **errp) {
     Object *obj = object_resolve_path(path, NULL);
     CXLEventDram dram;
     CXLEventRecordHdr *hdr = &dram.hdr;
@@ -3171,8 +3130,7 @@ void qmp_cxl_inject_dram_event(const char *path, CxlEventLog log, uint8_t flags,
     enc_log = rc;
 
     memset(&dram, 0, sizeof(dram));
-    cxl_assign_event_header(hdr, &dram_uuid, flags, sizeof(dram),
-                            cxl_device_get_timestamp(&ct3d->cxl_dstate));
+    cxl_assign_event_header(hdr, &dram_uuid, flags, sizeof(dram), cxl_device_get_timestamp(&ct3d->cxl_dstate));
     stq_le_p(&dram.phys_addr, dpa);
     dram.descriptor = descriptor;
     dram.type = type;
@@ -3216,8 +3174,7 @@ void qmp_cxl_inject_dram_event(const char *path, CxlEventLog log, uint8_t flags,
     if (has_correction_mask) {
         int count = 0;
         while (correction_mask && count < 4) {
-            stq_le_p(&dram.correction_mask[count],
-                     correction_mask->value);
+            stq_le_p(&dram.correction_mask[count], correction_mask->value);
             count++;
             correction_mask = correction_mask->next;
         }
@@ -3231,18 +3188,11 @@ void qmp_cxl_inject_dram_event(const char *path, CxlEventLog log, uint8_t flags,
     }
 }
 
-void qmp_cxl_inject_memory_module_event(const char *path, CxlEventLog log,
-                                        uint8_t flags, uint8_t type,
-                                        uint8_t health_status,
-                                        uint8_t media_status,
-                                        uint8_t additional_status,
-                                        uint8_t life_used,
-                                        int16_t temperature,
-                                        uint32_t dirty_shutdown_count,
-                                        uint32_t corrected_volatile_error_count,
-                                        uint32_t corrected_persist_error_count,
-                                        Error **errp)
-{
+void qmp_cxl_inject_memory_module_event(const char *path, CxlEventLog log, uint8_t flags, uint8_t type,
+                                        uint8_t health_status, uint8_t media_status, uint8_t additional_status,
+                                        uint8_t life_used, int16_t temperature, uint32_t dirty_shutdown_count,
+                                        uint32_t corrected_volatile_error_count, uint32_t corrected_persist_error_count,
+                                        Error **errp) {
     Object *obj = object_resolve_path(path, NULL);
     CXLEventMemoryModule module;
     CXLEventRecordHdr *hdr = &module.hdr;
@@ -3280,10 +3230,8 @@ void qmp_cxl_inject_memory_module_event(const char *path, CxlEventLog log,
     module.life_used = life_used;
     stw_le_p(&module.temperature, temperature);
     stl_le_p(&module.dirty_shutdown_count, dirty_shutdown_count);
-    stl_le_p(&module.corrected_volatile_error_count,
-             corrected_volatile_error_count);
-    stl_le_p(&module.corrected_persistent_error_count,
-             corrected_persist_error_count);
+    stl_le_p(&module.corrected_volatile_error_count, corrected_volatile_error_count);
+    stl_le_p(&module.corrected_persistent_error_count, corrected_persist_error_count);
 
     if (cxl_event_insert(cxlds, enc_log, (CXLEventRecordRaw *)&module)) {
         cxl_event_irq_assert(ct3d);
@@ -3295,9 +3243,7 @@ void qmp_cxl_inject_memory_module_event(const char *path, CxlEventLog log,
  * the list.
  * Return value: return true if has overlaps; otherwise, return false
  */
-bool cxl_extents_overlaps_dpa_range(CXLDCExtentList *list,
-                                    uint64_t dpa, uint64_t len)
-{
+bool cxl_extents_overlaps_dpa_range(CXLDCExtentList *list, uint64_t dpa, uint64_t len) {
     CXLDCExtent *ent;
     Range range1, range2;
 
@@ -3321,9 +3267,7 @@ bool cxl_extents_overlaps_dpa_range(CXLDCExtentList *list,
  * Will check multiple extents containment once superset release is added.
  * Return value: return true if range is contained; otherwise, return false
  */
-bool cxl_extents_contains_dpa_range(CXLDCExtentList *list,
-                                    uint64_t dpa, uint64_t len)
-{
+bool cxl_extents_contains_dpa_range(CXLDCExtentList *list, uint64_t dpa, uint64_t len) {
     CXLDCExtent *ent;
     Range range1, range2;
 
@@ -3341,9 +3285,7 @@ bool cxl_extents_contains_dpa_range(CXLDCExtentList *list,
     return false;
 }
 
-bool cxl_extent_groups_overlaps_dpa_range(CXLDCExtentGroupList *list,
-                                          uint64_t dpa, uint64_t len)
-{
+bool cxl_extent_groups_overlaps_dpa_range(CXLDCExtentGroupList *list, uint64_t dpa, uint64_t len) {
     CXLDCExtentGroup *group;
 
     if (!list) {
@@ -3362,10 +3304,9 @@ bool cxl_extent_groups_overlaps_dpa_range(CXLDCExtentGroupList *list,
  * The main function to process dynamic capacity event with extent list.
  * Currently DC extents add/release requests are processed.
  */
-static void qmp_cxl_process_dynamic_capacity_prescriptive(const char *path,
-        uint16_t hid, CXLDCEventType type, uint8_t rid,
-        CxlDynamicCapacityExtentList *records, Error **errp)
-{
+static void qmp_cxl_process_dynamic_capacity_prescriptive(const char *path, uint16_t hid, CXLDCEventType type,
+                                                          uint8_t rid, CxlDynamicCapacityExtentList *records,
+                                                          Error **errp) {
     Object *obj;
     CXLType3Dev *dcd;
     uint32_t num_extents = 0;
@@ -3387,7 +3328,6 @@ static void qmp_cxl_process_dynamic_capacity_prescriptive(const char *path,
         error_setg(errp, "No dynamic capacity support from the device");
         return;
     }
-
 
     if (rid >= dcd->dc.num_regions) {
         error_setg(errp, "region id is too large");
@@ -3419,35 +3359,28 @@ static void qmp_cxl_process_dynamic_capacity_prescriptive(const char *path,
         }
 
         /* No duplicate or overlapped extents are allowed */
-        if (test_any_bits_set(blk_bitmap, offset / block_size,
-                              len / block_size)) {
+        if (test_any_bits_set(blk_bitmap, offset / block_size, len / block_size)) {
             error_setg(errp, "duplicate or overlapped extents are detected");
             return;
         }
         bitmap_set(blk_bitmap, offset / block_size, len / block_size);
 
         if (type == DC_EVENT_RELEASE_CAPACITY) {
-            if (cxl_extent_groups_overlaps_dpa_range(&dcd->dc.extents_pending,
-                                                     dpa, len)) {
-                error_setg(errp,
-                           "cannot release extent with pending DPA range");
+            if (cxl_extent_groups_overlaps_dpa_range(&dcd->dc.extents_pending, dpa, len)) {
+                error_setg(errp, "cannot release extent with pending DPA range");
                 return;
             }
             if (!ct3_test_region_block_backed(dcd, dpa, len)) {
-                error_setg(errp,
-                           "cannot release extent with non-existing DPA range");
+                error_setg(errp, "cannot release extent with non-existing DPA range");
                 return;
             }
         } else if (type == DC_EVENT_ADD_CAPACITY) {
             if (cxl_extents_overlaps_dpa_range(&dcd->dc.extents, dpa, len)) {
-                error_setg(errp,
-                           "cannot add DPA already accessible to the same LD");
+                error_setg(errp, "cannot add DPA already accessible to the same LD");
                 return;
             }
-            if (cxl_extent_groups_overlaps_dpa_range(&dcd->dc.extents_pending,
-                                                     dpa, len)) {
-                error_setg(errp,
-                           "cannot add DPA again while still pending");
+            if (cxl_extent_groups_overlaps_dpa_range(&dcd->dc.extents_pending, dpa, len)) {
+                error_setg(errp, "cannot add DPA again while still pending");
                 return;
             }
         }
@@ -3469,10 +3402,7 @@ static void qmp_cxl_process_dynamic_capacity_prescriptive(const char *path,
         memset(extents[i].tag, 0, 0x10);
         extents[i].shared_seq = 0;
         if (type == DC_EVENT_ADD_CAPACITY) {
-            group = cxl_insert_extent_to_extent_group(group,
-                                                      extents[i].start_dpa,
-                                                      extents[i].len,
-                                                      extents[i].tag,
+            group = cxl_insert_extent_to_extent_group(group, extents[i].start_dpa, extents[i].len, extents[i].tag,
                                                       extents[i].shared_seq);
         }
 
@@ -3487,17 +3417,12 @@ static void qmp_cxl_process_dynamic_capacity_prescriptive(const char *path,
     cxl_create_dc_event_records_for_extents(dcd, type, extents, num_extents);
 }
 
-void qmp_cxl_add_dynamic_capacity(const char *path, uint16_t host_id,
-                                  CxlExtentSelectionPolicy sel_policy,
-                                  uint8_t region, const char *tag,
-                                  CxlDynamicCapacityExtentList  *extents,
-                                  Error **errp)
-{
+void qmp_cxl_add_dynamic_capacity(const char *path, uint16_t host_id, CxlExtentSelectionPolicy sel_policy,
+                                  uint8_t region, const char *tag, CxlDynamicCapacityExtentList *extents,
+                                  Error **errp) {
     switch (sel_policy) {
     case CXL_EXTENT_SELECTION_POLICY_PRESCRIPTIVE:
-        qmp_cxl_process_dynamic_capacity_prescriptive(path, host_id,
-                                                      DC_EVENT_ADD_CAPACITY,
-                                                      region, extents, errp);
+        qmp_cxl_process_dynamic_capacity_prescriptive(path, host_id, DC_EVENT_ADD_CAPACITY, region, extents, errp);
         return;
     default:
         error_setg(errp, "Selection policy not supported");
@@ -3505,17 +3430,10 @@ void qmp_cxl_add_dynamic_capacity(const char *path, uint16_t host_id,
     }
 }
 
-void qmp_cxl_release_dynamic_capacity(const char *path, uint16_t host_id,
-                                      CxlExtentRemovalPolicy removal_policy,
-                                      bool has_forced_removal,
-                                      bool forced_removal,
-                                      bool has_sanitize_on_release,
-                                      bool sanitize_on_release,
-                                      uint8_t region,
-                                      const char *tag,
-                                      CxlDynamicCapacityExtentList  *extents,
-                                      Error **errp)
-{
+void qmp_cxl_release_dynamic_capacity(const char *path, uint16_t host_id, CxlExtentRemovalPolicy removal_policy,
+                                      bool has_forced_removal, bool forced_removal, bool has_sanitize_on_release,
+                                      bool sanitize_on_release, uint8_t region, const char *tag,
+                                      CxlDynamicCapacityExtentList *extents, Error **errp) {
     CXLDCEventType type = DC_EVENT_RELEASE_CAPACITY;
 
     if (has_forced_removal && forced_removal) {
@@ -3527,8 +3445,7 @@ void qmp_cxl_release_dynamic_capacity(const char *path, uint16_t host_id,
 
     switch (removal_policy) {
     case CXL_EXTENT_REMOVAL_POLICY_PRESCRIPTIVE:
-        qmp_cxl_process_dynamic_capacity_prescriptive(path, host_id, type,
-                                                      region, extents, errp);
+        qmp_cxl_process_dynamic_capacity_prescriptive(path, host_id, type, region, extents, errp);
         return;
     default:
         error_setg(errp, "Removal policy not supported");
@@ -3536,8 +3453,7 @@ void qmp_cxl_release_dynamic_capacity(const char *path, uint16_t host_id,
     }
 }
 
-static void ct3_class_init(ObjectClass *oc, const void *data)
-{
+static void ct3_class_init(ObjectClass *oc, const void *data) {
     DeviceClass *dc = DEVICE_CLASS(oc);
     PCIDeviceClass *pc = PCI_DEVICE_CLASS(oc);
     CXLType3Class *cvc = CXL_TYPE3_CLASS(oc);
@@ -3569,16 +3485,9 @@ static const TypeInfo ct3d_info = {
     .class_size = sizeof(struct CXLType3Class),
     .class_init = ct3_class_init,
     .instance_size = sizeof(CXLType3Dev),
-    .interfaces = (const InterfaceInfo[]) {
-        { INTERFACE_CXL_DEVICE },
-        { INTERFACE_PCIE_DEVICE },
-        {}
-    },
+    .interfaces = (const InterfaceInfo[]){{INTERFACE_CXL_DEVICE}, {INTERFACE_PCIE_DEVICE}, {}},
 };
 
-static void ct3d_registers(void)
-{
-    type_register_static(&ct3d_info);
-}
+static void ct3d_registers(void) { type_register_static(&ct3d_info); }
 
 type_init(ct3d_registers);
